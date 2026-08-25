@@ -105,6 +105,39 @@ ADD_TEST(parse_direct_task_result) {
     }
 }
 
+ADD_TEST(parse_structured_status_message) {
+    auto mt = std::make_shared<MockTransport>();
+    auto creds = make_credential_provider();
+    A2AClient client(mt, std::shared_ptr<CredentialProvider>(std::move(creds)));
+    mt->queue.push_back(HttpResponse{200, R"({
+      "jsonrpc":"2.0","id":"1","result":{"tasks":[{
+        "id":"hermes-task","contextId":"hermes-context",
+        "status":{
+          "state":"TASK_STATE_COMPLETED","timestamp":"2026-08-25T17:27:04.995Z",
+          "message":{
+            "messageId":"hermes-message","role":"ROLE_AGENT",
+            "contextId":"hermes-context",
+            "parts":[{"text":"A2A is working.","mediaType":"text/plain"}]
+          }
+        }
+      }]}}
+    )", false, ""});
+
+    auto result = client.listTasks("http://hermes/a2a", AuthSpec{}, "", 100);
+    CHECK(result.ok);
+    CHECK_EQ(result.tasks.size(), size_t{1});
+    if (!result.tasks.empty()) {
+        const auto& task = result.tasks.front();
+        CHECK_EQ(task.state, TaskState::Completed);
+        CHECK_EQ(task.state_message, std::string("A2A is working."));
+        CHECK_EQ(task.messages.size(), size_t{1});
+        if (!task.messages.empty()) {
+            CHECK_EQ(task.messages.front().role, std::string("agent"));
+            CHECK_EQ(task.messages.front().text(), std::string("A2A is working."));
+        }
+    }
+}
+
 ADD_TEST(list_tasks_parses_remote_collection) {
     auto mt = std::make_shared<MockTransport>();
     auto creds = make_credential_provider();

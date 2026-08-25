@@ -160,7 +160,15 @@ std::optional<Task> A2AClient::parseTask(const nlohmann::json& j) {
         const auto& st = j["status"];
         auto state = parse_task_state_wire(st.value("state", ""));
         t.state = state.value_or(TaskState::Submitted);
-        t.state_message = st.value("message", "");
+        // A2A 1.0 defines status.message as a structured Message.  Retain
+        // support for older agents that sent a plain string here.
+        if (st.contains("message") && st["message"].is_object()) {
+            Message message = parseMessage(st["message"]);
+            t.state_message = message.text();
+            t.messages.push_back(std::move(message));
+        } else if (st.contains("message") && st["message"].is_string()) {
+            t.state_message = st["message"].get<std::string>();
+        }
         t.last_state_change = st.value("timestamp", "");
     }
     if (j.contains("history") && j["history"].is_array())

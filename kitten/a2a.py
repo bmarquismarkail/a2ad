@@ -249,14 +249,18 @@ def main(args: list[str]) -> int:
 
         if ns.cmd == "remote-list":
             r = _rpc(path, {"op": "remote_list", "agent": ns.agent,
-                            "context_id": ns.context_id})
+                            "context_id": ns.context_id}, timeout=35.0)
             if not r.get("ok"):
                 _die(f"error: {r.get('error', 'unknown')}")
             if ns.json:
                 print(json.dumps(r["tasks"], indent=2))
             else:
-                for task in r["tasks"]:
+                tasks = r["tasks"]
+                if not tasks:
+                    print("(no remote tasks)")
+                for task in tasks:
                     print(_task_line(task))
+                print(f"\n{len(tasks)} task(s)")
             return 0
 
         if ns.cmd == "agents":
@@ -287,7 +291,7 @@ def main(args: list[str]) -> int:
                 "agent": agent,
                 "message": msg,
                 "cwd": os.getcwd(),
-            })
+            }, timeout=35.0)
             if not r.get("ok"):
                 _die(f"error: {r.get('error', 'unknown')}")
             tid = r.get("task_id", "")
@@ -302,7 +306,8 @@ def main(args: list[str]) -> int:
             text = " ".join(ns.text).strip()
             if not text:
                 _die("respond requires non-empty text")
-            r = _rpc(path, {"op": "respond", "task_id": ns.task_id, "message": text})
+            r = _rpc(path, {"op": "respond", "task_id": ns.task_id,
+                            "message": text}, timeout=35.0)
             if not r.get("ok"):
                 _die(f"error: {r.get('error', 'unknown')}")
             print(f"responded to {ns.task_id}; state now {_state_tag(r.get('state','?'))}")
