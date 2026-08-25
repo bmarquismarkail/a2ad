@@ -39,6 +39,15 @@ ln -s /home/brandon/src/projects/a2ad/kitten/a2a.py ~/.config/kitty/kittens/a2a.
 After that, `kitty +kitten a2a list` works from any kitty shell, or map a
 shortcut (below).
 
+The explicit script form also works:
+
+```sh
+kitten a2a.py list
+```
+
+Kitty includes `a2a.py` in `main(args)` for this form; the kitten normalizes
+that launcher token before parsing the `list` subcommand.
+
 ### Validated against the installed Kitty 0.48.2
 
 Before writing the kitten, the following were confirmed from the installed

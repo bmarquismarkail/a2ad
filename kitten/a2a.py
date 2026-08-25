@@ -40,6 +40,18 @@ STATE_COLORS = {
 RESET = "\033[0m"
 
 
+def _command_args(args: list[str]) -> list[str]:
+    """Normalize Kitty's two custom-kitten invocation conventions.
+
+    `kitten /path/to/a2a.py list` includes the script path in main(args), while
+    `kitty +kitten a2a list` and the standalone entry point do not. Strip only
+    this kitten's launcher token so a real subcommand is never discarded.
+    """
+    if args and os.path.basename(args[0]) == "a2a.py":
+        return args[1:]
+    return args
+
+
 def _socket_path() -> str:
     p = os.environ.get("A2AD_SOCK")
     if p:
@@ -203,7 +215,7 @@ def main(args: list[str]) -> int:
     p_watch.add_argument("task_id")
     p_watch.add_argument("--interval", type=float, default=2.0)
 
-    ns = parser.parse_args(args)
+    ns = parser.parse_args(_command_args(args))
     path = _socket_path()
 
     try:
