@@ -1,0 +1,15 @@
+# Build
+build/
+*.o
+*.a
+*.pyc
+__pycache__/
+
+# Editor / IDE
+.cache/
+.clangd
+compile_commands.json
+.idea/
+.vscode/
+*.swp
+*~

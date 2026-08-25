@@ -1,0 +1,40 @@
+# kitty-a2a agent registry — EXAMPLE
+# Copy to ~/.config/kitty-a2a/agents.yaml and edit. The daemon reads this at
+# startup (or the path given via `a2ad --config ...`).
+#
+# DESIGN.md §6/§20: this file is NON-SECRET. It names agents, their endpoints,
+# and which *reference* to use for auth — it never holds credential values.
+# Credential values are resolved at request time by the CredentialProvider from
+# environment variables or a 0600 credential file (auth.type below).
+#
+# --- agents: registry of A2A endpoints --------------------------------------
+agents:
+  cpp-specialist:
+    endpoint: "https://dev01.internal/a2a"
+    host_label: "dev01"          # short label for the in-terminal picker
+    auth:
+      type: env                  # env | credential-file | none
+      name: CPP_AGENT_TOKEN      # env var to read (type=env) OR file path (type=credential-file)
+  general:
+    endpoint: "https://agents.example.internal/a2a"
+    host_label: "general"
+    auth:
+      type: none
+
+# --- projects: path-prefix routing ------------------------------------------
+# Maps a project directory (longest-prefix wins) to a default agent. When the
+# kitten submits from cwd, the daemon picks the most specific matching default
+# agent if the user doesn't name one explicitly.
+projects:
+  /data/projects/proto-time:
+    default_agent: cpp-specialist
+  /data/projects:
+    default_agent: general
+
+# --- ipc: daemon <-> kitten -------------------------------------------------
+# The Unix domain socket the daemon listens on. The kitten connects here.
+ipc:
+  socket: "${XDG_RUNTIME_DIR:-$HOME/.cache/kitty-a2a}/a2ad.sock"
+  # Optional: poll non-terminal tasks every N seconds and emit
+  # `task.state_changed` events so a watching tab updates live. 0 = disabled.
+  reconcile_interval_sec: 5

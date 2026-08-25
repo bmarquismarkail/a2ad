@@ -1,0 +1,23 @@
+[Unit]
+Description=kitty-a2a daemon (a2ad) — A2A agent orchestrator for Kitty terminals
+Documentation=file:///home/brandon/src/projects/a2ad/DESIGN.md
+# Start after the user session is fully up (so XDG_RUNTIME_DIR is set).
+After=default.target
+
+[Service]
+Type=simple
+# User is filled in at install time: systemd --user units run as the invoking
+# user by default, but we set it explicitly for clarity.
+ExecStart=/usr/local/bin/a2ad --config %h/.config/kitty-a2a/agents.yaml
+# If you want the reconcile loop, add --reconcile 5 to ExecStart.
+Restart=on-failure
+RestartSec=2
+
+# Hardening (best-effort; adjust to taste).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=default.target

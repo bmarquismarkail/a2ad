@@ -1,0 +1,94 @@
+cmake_minimum_required(VERSION 3.16)
+project(kitty_a2ad VERSION 0.1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+endif()
+
+add_compile_options(-Wall -Wextra -Wno-unused-parameter)
+
+# --- Dependencies -------------------------------------------------------------
+# nlohmann_json
+find_package(nlohmann_json 3.10 QUIET)
+if(NOT nlohmann_json_FOUND)
+    # Fallback: header-only from a known system path.
+    find_path(NLOHMANN_JSON_INCLUDE_DIR nlohmann/json.hpp)
+    if(NOT NLOHMANN_JSON_INCLUDE_DIR)
+        message(FATAL_ERROR "nlohmann_json not found (apt install nlohmann-json3-dev)")
+    endif()
+else()
+    find_package(nlohmann_json 3.10 REQUIRED)
+endif()
+
+# libcurl
+find_package(CURL REQUIRED)
+
+# SQLite3
+find_package(SQLite3 REQUIRED)
+
+# yaml-cpp
+find_package(yaml-cpp REQUIRED)
+
+# Threads
+find_package(Threads REQUIRED)
+
+# --- Daemon library (everything except main) ---------------------------------
+add_library(a2ad_core STATIC
+    daemon/src/types.cpp
+    daemon/src/Artifact.cpp
+    daemon/src/AgentCard.cpp
+    daemon/src/Config.cpp
+    daemon/src/Credentials.cpp
+    daemon/src/A2AClient.cpp
+    daemon/src/Database.cpp
+    daemon/src/IpcServer.cpp
+    daemon/src/TaskManager.cpp
+    daemon/src/HttpTransport.cpp
+)
+target_include_directories(a2ad_core PUBLIC daemon/include)
+target_link_libraries(a2ad_core PUBLIC
+    nlohmann_json::nlohmann_json
+    CURL::libcurl
+    SQLite::SQLite3
+    yaml-cpp
+    Threads::Threads
+)
+
+# --- Daemon executable --------------------------------------------------------
+add_executable(a2ad daemon/src/main.cpp)
+target_link_libraries(a2ad PRIVATE a2ad_core)
+
+# --- Tests --------------------------------------------------------------------
+enable_testing()
+
+add_executable(a2ad_tests
+    tests/daemon/test_main.cpp
+    tests/daemon/types_test.cpp
+    tests/daemon/artifact_test.cpp
+    tests/daemon/config_test.cpp
+    tests/daemon/a2a_client_test.cpp
+    tests/daemon/credentials_test.cpp
+    tests/daemon/database_test.cpp
+    tests/daemon/protocol_test.cpp
+)
+target_link_libraries(a2ad_tests PRIVATE a2ad_core)
+target_compile_definitions(a2ad_tests PRIVATE A2AD_TESTING)
+
+add_test(NAME unit COMMAND a2ad_tests)
+
+# Integration test: daemon + mock A2A server over the real socket.
+add_executable(a2ad_e2e tests/ipc/e2e.cpp)
+target_include_directories(a2ad_e2e PRIVATE ${CMAKE_SOURCE_DIR}/daemon/include)
+target_link_libraries(a2ad_e2e PRIVATE a2ad_core)
+target_compile_definitions(a2ad_e2e PRIVATE A2AD_BIN="${CMAKE_BINARY_DIR}/a2ad")
+add_test(NAME e2e COMMAND a2ad_e2e)
+set_tests_properties(e2e PROPERTIES TIMEOUT 60)
+
+install(TARGETS a2ad RUNTIME DESTINATION bin)
+install(FILES kitten/a2a.py DESTINATION ${CMAKE_INSTALL_PREFIX}/share/kitty/kittens)
+install(FILES config/agents.example.yaml DESTINATION ${CMAKE_INSTALL_PREFIX}/share/kitty-a2a)
