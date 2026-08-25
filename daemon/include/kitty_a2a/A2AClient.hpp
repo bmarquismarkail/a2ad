@@ -5,6 +5,9 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <stop_token>
+#include <map>
+#include <mutex>
 
 #include <nlohmann/json.hpp>
 
@@ -23,6 +26,7 @@ namespace kitty_a2a {
 struct A2AResult {
     bool ok = false;
     std::optional<Task> task;
+    std::vector<Task> tasks;            // ListTasks result
     std::string message_text;          // when the agent replied with a Message (not a Task)
     std::string context_id;
 
@@ -60,6 +64,17 @@ public:
     virtual HttpResponse request(const std::string& endpoint, const std::string& method,
                                  const std::string& path, const std::string& body,
                                  const std::vector<std::pair<std::string, std::string>>& headers) = 0;
+
+    // Stream response chunks. The default preserves compatibility with simple
+    // transports/mocks by delivering a buffered response once.
+    virtual HttpResponse stream(const std::string& endpoint, const std::string& method,
+                                const std::string& path, const std::string& body,
+                                const std::vector<std::pair<std::string, std::string>>& headers,
+                                const std::function<bool(std::string_view)>& on_chunk) {
+        auto response = request(endpoint, method, path, body, headers);
+        if (!response.body.empty()) on_chunk(response.body);
+        return response;
+    }
 };
 
 // Isolated A2A 1.0 client over the JSON-RPC 2.0 binding (DESIGN.md §22).
@@ -93,6 +108,20 @@ public:
     // Request cancellation (CancelTask).
     A2AResult cancelTask(const std::string& endpoint, const AuthSpec& auth, const TaskId& task_id);
 
+    // List tasks known by the remote agent (as opposed to the daemon's local
+    // persisted registry). Optional context/state filters follow A2A v1.0.
+    A2AResult listTasks(const std::string& endpoint, const AuthSpec& auth,
+                        const std::string& context_id = {}, int page_size = 100);
+
+    // Fetch an artifact URL with the same credential policy as A2A calls.
+    HttpResponse download(const std::string& url, const AuthSpec& auth);
+
+    // Blocking SSE subscription. Returns when the stream closes or stop is
+    // requested; each valid Task update is delivered immediately.
+    A2AResult subscribeToTask(const std::string& endpoint, const AuthSpec& auth,
+                              const TaskId& task_id, const std::function<void(const Task&)>& on_task,
+                              std::stop_token stop = {});
+
     // Access the credential provider (used by the TaskManager to resolve auth
     // for an agent from its non-secret config reference).
     std::shared_ptr<CredentialProvider> credentials() const { return creds_; }
@@ -111,6 +140,8 @@ private:
     std::shared_ptr<HttpTransport> transport_;
     std::shared_ptr<CredentialProvider> creds_;
     Options opts_;
+    std::mutex bindings_mutex_;
+    std::map<std::string, std::string> bindings_; // interface URL -> normalized binding
 };
 
 }  // namespace kitty_a2a

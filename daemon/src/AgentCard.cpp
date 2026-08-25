@@ -3,13 +3,10 @@
 namespace kitty_a2a {
 
 std::string Agent::effective_endpoint() const {
-    // Prefer the first supported interface URL from the discovered card (the
-    // card is the source of truth for the actual endpoint), else fall back to
-    // the configured endpoint.
+    // The Agent Card orders interfaces by preference. All three standard v1
+    // bindings are implemented, so honor that ordering.
     if (card.has_value()) {
-        for (const auto& iface : card->interfaces) {
-            if (!iface.url.empty()) return iface.url;
-        }
+        for (const auto& iface : card->interfaces) if (!iface.url.empty()) return iface.url;
     }
     return endpoint;
 }

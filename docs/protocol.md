@@ -1,8 +1,7 @@
 # Protocol Reference
 
-Two protocols are in play: the **local IPC** between the kitten and the daemon,
-and the **A2A JSON-RPC** between the daemon and remote agents. Both are
-documented here as implemented.
+The local IPC connects the kitten to the daemon. The daemon negotiates the
+remote agent's advertised A2A binding: JSON-RPC, HTTP+JSON/REST, or gRPC.
 
 ## 1. Local IPC (kitten ⇄ daemon)
 
@@ -74,6 +73,24 @@ returning. →
 } }
 ```
 
+#### `remote_list`
+
+```json
+{ "op": "remote_list", "agent": "cpp-specialist", "context_id": "c-123",
+  "page_size": 100 }
+```
+
+Calls the remote agent's A2A `ListTasks`; it does not read the local registry.
+
+#### `artifact.materialize`
+
+```json
+{ "op": "artifact.materialize", "task_id": "t-abc", "artifact_id": "a-1",
+  "part": 0, "output_dir": "/tmp/results" }
+```
+
+Materializes a structured artifact part and returns its absolute `path`.
+
 #### `respond`
 ```json
 { "op": "respond", "task_id": "t-abc", "message": "use the emulator IR" }
@@ -113,10 +130,17 @@ The daemon broadcasts to every open connection:
   "from": "WORKING", "to": "INPUT_REQUIRED" }
 ```
 
-The v0 kitten does not consume these (it issues request/response calls); they
-are present for a future streaming UI.
+The `watch` command consumes state through refreshed task status and integrates
+it with Kitty titles/notifications; remote A2A polling remains daemon-owned.
 
-## 2. A2A JSON-RPC (daemon ⇄ remote agent)
+## 2. A2A bindings (daemon ⇄ remote agent)
+
+Agent Card `supportedInterfaces` ordering is honored. All standard A2A v1
+bindings are available: JSON-RPC, HTTP+JSON/REST, and native gRPC. gRPC sources
+are generated at build time from `proto/a2a.proto`; unary operations use a
+30-second deadline and subscriptions use cancellable server streams.
+
+### JSON-RPC
 
 **Transport**: HTTP POST, `Content-Type: application/json`. One request per
 call (no keep-alive multiplexing in v0). 30 s timeout.
@@ -141,7 +165,8 @@ or
 | `SendMessage` | `message` (role, parts, messageId, taskId?, contextId?)       | `submit`, `respond` |
 | `GetTask`     | `id` (task id)                                                | `status refresh`, `reconcile` |
 | `CancelTask`  | `id`                                                          | `cancel`   |
-| `SubscribeToTask` | (SSE — not implemented)                                   | —          |
+| `ListTasks`       | `contextId?`, `pageSize?`                                  | `remote_list` |
+| `SubscribeToTask` | `id` (SSE)                                                 | daemon stream |
 
 #### SendMessage (new task)
 ```json

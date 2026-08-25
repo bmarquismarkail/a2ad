@@ -1,8 +1,11 @@
 #include "kitty_a2a/A2AClient.hpp"
+#include "GrpcTransport.hpp"
 
 #include <atomic>
 #include <cctype>
 #include <string>
+#include <sstream>
+#include <algorithm>
 
 namespace json = nlohmann;
 
@@ -101,6 +104,11 @@ AgentCard A2AClient::discover(const std::string& endpoint) {
                     card.interfaces.push_back(std::move(ai));
                 }
             }
+            {
+                std::lock_guard lock(bindings_mutex_);
+                for (const auto& interface : card.interfaces)
+                    bindings_[interface.url] = interface.protocol_binding;
+            }
             if (j.contains("defaultInputModes") && j["defaultInputModes"].is_array())
                 for (const auto& m : j["defaultInputModes"]) if (m.is_string()) card.input_modes.push_back(m.get<std::string>());
             if (j.contains("defaultOutputModes") && j["defaultOutputModes"].is_array())
@@ -181,6 +189,15 @@ A2AResult A2AClient::rpcCall(const std::string& endpoint, const AuthSpec& auth,
     req["method"] = method;
     req["params"] = J::parse(params_json.empty() ? "{}" : params_json);
 
+    std::string binding = "JSONRPC";
+    {
+        std::lock_guard lock(bindings_mutex_);
+        if (auto it = bindings_.find(endpoint); it != bindings_.end()) binding = it->second;
+    }
+    std::transform(binding.begin(), binding.end(), binding.begin(),
+                   [](unsigned char c) { return std::toupper(c); });
+    const bool rest = binding == "HTTP+JSON" || binding == "REST" || binding == "HTTP_JSON";
+    const bool grpc = binding == "GRPC";
     std::vector<std::pair<std::string, std::string>> headers = {
         {"Content-Type", "application/json"},
         {"Accept", "application/json"},
@@ -190,7 +207,38 @@ A2AResult A2AClient::rpcCall(const std::string& endpoint, const AuthSpec& auth,
         headers.emplace_back(auth.header_name, auth.header_value);
     }
 
-    HttpResponse r = transport_->request(endpoint, "POST", "", req.dump(), headers);
+    HttpResponse r;
+    if (grpc) {
+        r = grpcCall(endpoint, auth, method, req["params"]);
+        if (!r.transport_error && r.status >= 200 && r.status < 300) {
+            try { r.body = nlohmann::json({{"jsonrpc", "2.0"}, {"result", nlohmann::json::parse(r.body)}}).dump(); }
+            catch (...) { /* normal malformed-response handling below */ }
+        }
+    } else if (rest) {
+        headers[0].second = "application/a2a+json";
+        headers[1].second = "application/a2a+json";
+        headers.emplace_back("A2A-Version", "1.0");
+        std::string verb = "POST", path, body = req["params"].dump();
+        const auto& params = req["params"];
+        if (method == "SendMessage") path = "message:send";
+        else if (method == "GetTask") { verb = "GET"; path = "tasks/" + params.value("id", ""); body.clear(); }
+        else if (method == "ListTasks") {
+            verb = "GET"; path = "tasks"; body.clear();
+            if (params.contains("contextId")) path += "?contextId=" + params["contextId"].get<std::string>();
+        } else if (method == "CancelTask") path = "tasks/" + params.value("id", "") + ":cancel";
+        else {
+            A2AResult unsupported; unsupported.error_kind = A2AResult::ErrorKind::ProtocolError;
+            unsupported.error = "operation is not available through HTTP+JSON: " + method;
+            return unsupported;
+        }
+        r = transport_->request(endpoint, verb, path, body, headers);
+        if (!r.transport_error && r.status >= 200 && r.status < 300) {
+            try { r.body = nlohmann::json({{"jsonrpc", "2.0"}, {"result", nlohmann::json::parse(r.body)}}).dump(); }
+            catch (...) { /* normal malformed-response handling below */ }
+        }
+    } else {
+        r = transport_->request(endpoint, "POST", "", req.dump(), headers);
+    }
     if (r.transport_error) {
         out.ok = false;
         out.error_kind = A2AResult::ErrorKind::LocalNetwork;
@@ -256,7 +304,17 @@ A2AResult A2AClient::rpcCall(const std::string& endpoint, const AuthSpec& auth,
         }
     }
 
-    if (task_result) {
+    const J* task_list = nullptr;
+    if (result.is_array()) task_list = &result;
+    else if (result.is_object() && result.contains("tasks") && result["tasks"].is_array())
+        task_list = &result["tasks"];
+
+    if (task_list) {
+        for (const auto& item : *task_list) {
+            if (auto task = parseTask(item)) out.tasks.push_back(std::move(*task));
+        }
+        out.ok = true;
+    } else if (task_result) {
         auto t = parseTask(*task_result);
         if (!t) {
             out.ok = false;
@@ -323,6 +381,110 @@ A2AResult A2AClient::cancelTask(const std::string& endpoint, const AuthSpec& aut
     J params;
     params["id"] = task_id.value();
     return rpcCall(endpoint, auth, "CancelTask", params.dump());
+}
+
+A2AResult A2AClient::listTasks(const std::string& endpoint, const AuthSpec& auth,
+                               const std::string& context_id, int page_size) {
+    nlohmann::json params;
+    if (!context_id.empty()) params["contextId"] = context_id;
+    if (page_size > 0) params["pageSize"] = page_size;
+    return rpcCall(endpoint, auth, "ListTasks", params.dump());
+}
+
+HttpResponse A2AClient::download(const std::string& url, const AuthSpec& auth) {
+    std::vector<std::pair<std::string, std::string>> headers = {{"Accept", "*/*"},
+                                                                {"User-Agent", opts_.user_agent}};
+    if (auth.active && !auth.header_value.empty()) headers.emplace_back(auth.header_name, auth.header_value);
+    return transport_->request(url, "GET", "", "", headers);
+}
+
+A2AResult A2AClient::subscribeToTask(const std::string& endpoint, const AuthSpec& auth,
+                                     const TaskId& task_id,
+                                     const std::function<void(const Task&)>& on_task,
+                                     std::stop_token stop) {
+    nlohmann::json request = {{"jsonrpc", "2.0"}, {"id", std::to_string(id_counter++)},
+                              {"method", "SubscribeToTask"},
+                              {"params", {{"id", task_id.value()}}}};
+    std::string binding = "JSONRPC";
+    { std::lock_guard lock(bindings_mutex_); if (auto it = bindings_.find(endpoint); it != bindings_.end()) binding = it->second; }
+    std::transform(binding.begin(), binding.end(), binding.begin(), [](unsigned char c) { return std::toupper(c); });
+    const bool rest = binding == "HTTP+JSON" || binding == "REST" || binding == "HTTP_JSON";
+    const bool grpc = binding == "GRPC";
+    std::vector<std::pair<std::string, std::string>> headers = {
+        {"Content-Type", "application/json"}, {"Accept", "text/event-stream"},
+        {"Cache-Control", "no-cache"}, {"User-Agent", opts_.user_agent}};
+    if (auth.active && !auth.header_value.empty()) headers.emplace_back(auth.header_name, auth.header_value);
+
+    std::string pending;
+    auto consume = [&](std::string_view chunk) {
+        if (stop.stop_requested()) return false;
+        pending.append(chunk);
+        size_t boundary;
+        while ((boundary = pending.find("\n\n")) != std::string::npos) {
+            std::string event = pending.substr(0, boundary);
+            pending.erase(0, boundary + 2);
+            std::string data;
+            std::istringstream lines(event);
+            for (std::string line; std::getline(lines, line);) {
+                if (line.rfind("data:", 0) == 0) {
+                    if (!data.empty()) data += '\n';
+                    size_t start = line.size() > 5 && line[5] == ' ' ? 6 : 5;
+                    data += line.substr(start);
+                }
+            }
+            if (data.empty() || data == "[DONE]") continue;
+            try {
+                auto json = nlohmann::json::parse(data);
+                const auto* value = &json;
+                if (json.contains("result")) value = &json["result"];
+                if (value->contains("task")) value = &(*value)["task"];
+                if (auto task = parseTask(*value)) on_task(*task);
+            } catch (...) { /* malformed events do not terminate a healthy stream */ }
+        }
+        return !stop.stop_requested();
+    };
+    if (grpc) {
+        auto response = grpcSubscribe(endpoint, auth, task_id.value(), [&](const nlohmann::json& event) {
+            const nlohmann::json* value = &event;
+            if (event.contains("task")) value = &event["task"];
+            if (auto task = parseTask(*value)) on_task(*task);
+            else {
+                // Status/artifact/message stream deltas do not contain the
+                // complete Task. Refresh before persistence so a delta never
+                // erases existing history or artifacts.
+                auto current = getTask(endpoint, auth, task_id);
+                if (current.task) on_task(*current.task);
+            }
+            return !stop.stop_requested();
+        }, stop);
+        A2AResult result; result.http_status = response.status;
+        if (stop.stop_requested()) { result.ok = true; return result; }
+        if (response.transport_error) {
+            result.error_kind = A2AResult::ErrorKind::LocalNetwork;
+            result.error = "gRPC stream failed: " + response.transport_error_detail;
+        } else if (response.status < 200 || response.status >= 300) {
+            result.error_kind = A2AResult::ErrorKind::ProtocolError;
+            result.error = "SubscribeToTask gRPC failed: " + response.body;
+        } else result.ok = true;
+        return result;
+    }
+    if (rest) {
+        headers[0].second = "application/a2a+json";
+        headers.emplace_back("A2A-Version", "1.0");
+    }
+    auto response = transport_->stream(endpoint, rest ? "GET" : "POST",
+                                       rest ? "tasks/" + task_id.value() + ":subscribe" : "",
+                                       rest ? "" : request.dump(), headers, consume);
+    A2AResult result; result.http_status = response.status;
+    if (stop.stop_requested()) { result.ok = true; return result; }
+    if (response.transport_error) {
+        result.error_kind = A2AResult::ErrorKind::LocalNetwork;
+        result.error = "stream failed: " + response.transport_error_detail;
+    } else if (response.status < 200 || response.status >= 300) {
+        result.error_kind = A2AResult::ErrorKind::ProtocolError;
+        result.error = "SubscribeToTask returned HTTP " + std::to_string(response.status);
+    } else result.ok = true;
+    return result;
 }
 
 }  // namespace kitty_a2a

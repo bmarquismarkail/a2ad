@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <thread>
 
 #include "kitty_a2a/A2AClient.hpp"
 #include "kitty_a2a/AgentCard.hpp"
@@ -73,6 +74,9 @@ public:
     // endpoints (best-effort GetTask; on failure keep the last known state and
     // mark a reconciliation note, never a fake completion).
     void reconcileOnStartup();
+    // Subscribe to all persisted non-terminal tasks whose agents advertise
+    // streaming. Streams reconnect with bounded backoff until shutdown.
+    void startSubscriptions();
 
     // Create + submit a task. This performs the remote SendMessage (blocking the
     // caller briefly) and records the resulting task.
@@ -90,9 +94,17 @@ public:
 
     // Queries (synchronous, under the state mutex).
     std::vector<TaskSummary> listTasks(bool include_terminal = true);
+    A2AResult listRemoteTasks(const std::string& agent, const std::string& context_id = {},
+                              int page_size = 100);
     std::optional<Task> getTask(const std::string& id);
     std::vector<Agent> listAgents();
     std::vector<std::string> listAgentIds() const;
+
+    // Materialize one protocol artifact part into a caller-selected directory.
+    // The returned path is canonicalized beneath output_dir.
+    bool materializeArtifact(const std::string& task_id, const std::string& artifact_id,
+                             size_t part_index, const std::string& output_dir,
+                             std::string* output_path, std::string* error);
 
     // Refresh an agent's Agent Card + availability. Returns the agent after.
     Agent discoverAgent(const std::string& id);
@@ -104,6 +116,7 @@ public:
     void setEventSink(EventSink sink) { event_sink_ = std::move(sink); }
 
 private:
+    void startSubscription(const Task& task);
     void emitStateChanged(const std::string& task_id, TaskState old_state, TaskState new_state);
     // Resolve the agent's endpoint + auth spec for a request.
     bool resolveEndpoint(const AgentId& id, std::string* endpoint, AuthSpec* auth) const;
@@ -117,6 +130,7 @@ private:
 
     // Cached auth specs per agent (re-resolved on demand; values never logged).
     EventSink event_sink_;
+    std::vector<std::jthread> subscriptions_;
 };
 
 }  // namespace kitty_a2a

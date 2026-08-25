@@ -16,7 +16,7 @@ a2ad  (C++20 daemon, persistent, owns all state)
    |
    +-- Database       SQLite at $XDG_STATE_HOME/kitty-a2a/a2ad.db
    +-- TaskManager    the state owner; routes, creates, refreshes, cancels
-   +-- A2AClient      A2A v1 JSON-RPC over HTTP; pluggable HttpTransport
+   +-- A2AClient      A2A v1 JSON-RPC, HTTP+JSON, and native gRPC
    +-- IpcServer      Unix domain socket, NDJSON, one accept thread
    +-- Config         agents.yaml (YAML), XDG-aware paths
    +-- CredentialProvider  env / file / none — secrets never in config
@@ -35,13 +35,13 @@ One daemon per user. It:
 3. binds the Unix socket at `$XDG_RUNTIME_DIR/kitty-a2a/a2ad.sock`
    (0600, parent 0700),
 4. does a best-effort `discoverAllAgents()` (GET the Agent Card),
-5. optionally runs a reconcile loop (`--reconcile <sec>`) that polls every
-   non-terminal task's agent and broadcasts `task.state_changed` events,
+5. subscribes to streaming-capable agents and optionally runs the configured
+   polling reconcile fallback for other non-terminal tasks,
 6. blocks on SIGINT/SIGTERM; on exit it `sqlite3_close()`s and removes the
    socket file.
 
-It never holds an SSE subscription (v0) — polling is the refresh mechanism
-(DESIGN.md §17).
+Streaming subscriptions are daemon-owned. The kitten never connects directly
+to a remote A2A stream (DESIGN.md §17).
 
 ## Threading
 
@@ -49,9 +49,9 @@ It never holds an SSE subscription (v0) — polling is the refresh mechanism
 - One short-lived thread per IPC connection (kitten calls are short-lived).
 - TaskManager serializes mutating operations with a `std::mutex`.
 - The reconcile loop runs on the main thread between sleep iterations.
-- A2AClient uses libcurl; each request is a fresh `CURL` handle in its own
-  thread of control (the connection thread or the reconcile thread), so no
-  shared handle state.
+- A2AClient uses fresh libcurl handles for JSON-RPC/REST and gRPC channels for
+  Protobuf RPCs. TaskManager owns cancellable subscription threads and joins
+  them during shutdown.
 
 ## Persistence
 
@@ -67,9 +67,7 @@ to recover post-crash state (DESIGN.md §18).
 DESIGN.md was written against the A2A **v0.3** REST-style API. The current
 upstream A2A is **v1.0**, which is normative in **Protobuf** and offers three
 equivalent bindings: JSON-RPC 2.0 over HTTP/SSE, gRPC, and HTTP/REST. The
-implementation below follows **JSON-RPC over HTTP** because it is the
-most portable of the three and is what the daemon can call with a bare
-libcurl dependency.
+implementation supports all three and honors Agent Card interface preference.
 
 ### Enum spelling (the big one)
 
@@ -166,13 +164,10 @@ v0 has no auth on the socket (DESIGN.md §5: local socket, per-user, 0600).
 returns a non-empty value. YAML config holds **references only** — never the
 secret (DESIGN.md §20).
 
-## What is intentionally NOT built in v0
+## Transport boundary
 
-- SSE subscription / streaming responses (polling instead).
-- gRPC and REST bindings (JSON-RPC only).
-- Multi-user / remote socket access.
-- `ListTasks` as an IPC op (the daemon can list its own DB; pulling a remote
-  agent's full task list is out of scope for the vertical slice).
-- Artifact download / file materialization (artifacts are stored as blobs).
-
-These are all in DESIGN.md and are expected follow-on work.
+JSON-RPC, HTTP+JSON/REST, and native gRPC are implemented, including SSE and
+gRPC server-streaming subscriptions. Agent Card ordering drives binding
+selection. Remote `ListTasks`, artifact materialization, and project-aware
+routing are also implemented. Multi-user/remote IPC remains intentionally out
+of scope per the local single-user daemon design.

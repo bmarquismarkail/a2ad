@@ -27,6 +27,7 @@ import socket
 import sys
 import tempfile
 import time
+import subprocess
 
 STATE_COLORS = {
     "WORKING": "\033[34m",       # blue
@@ -143,6 +144,23 @@ def _detail(t: dict) -> list[str]:
     return lines
 
 
+def _set_tab_title(title: str) -> None:
+    """Best-effort Kitty integration; harmless when run outside Kitty."""
+    if not os.environ.get("KITTY_WINDOW_ID"):
+        return
+    subprocess.run(["kitty", "@", "set-tab-title", "--match",
+                    f"id:{os.environ['KITTY_WINDOW_ID']}", title],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def _notify(title: str, body: str) -> None:
+    # Kitty's OSC 99 notification protocol does not require remote-control
+    # permission and works through SSH when the terminal supports it.
+    sys.stdout.write(f"\033]99;i=kitty-a2a:d=0;{title}\033\\")
+    sys.stdout.write(f"\033]99;i=kitty-a2a:p=body;{body}\033\\")
+    sys.stdout.flush()
+
+
 def main(args: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="kitten a2a.py", description="kitty-a2a client")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -150,6 +168,11 @@ def main(args: list[str]) -> int:
     p_list = sub.add_parser("list", help="list tasks")
     p_list.add_argument("--all", action="store_true", help="include terminal tasks")
     p_list.add_argument("--json", action="store_true", help="raw JSON output")
+
+    p_remote = sub.add_parser("remote-list", help="list tasks directly from an agent")
+    p_remote.add_argument("agent")
+    p_remote.add_argument("--context-id", default="")
+    p_remote.add_argument("--json", action="store_true")
 
     p_status = sub.add_parser("status", help="task detail")
     p_status.add_argument("task_id")
@@ -160,6 +183,8 @@ def main(args: list[str]) -> int:
     p_submit = sub.add_parser("submit", help="submit a prompt to an agent")
     p_submit.add_argument("agent")
     p_submit.add_argument("message", nargs="*", help="prompt text (words joined by spaces)")
+    p_submit.add_argument("--route", action="store_true",
+                          help="route by cwd; the positional agent becomes the first message word")
 
     p_respond = sub.add_parser("respond", help="answer an input-required task")
     p_respond.add_argument("task_id")
@@ -167,6 +192,16 @@ def main(args: list[str]) -> int:
 
     p_cancel = sub.add_parser("cancel", help="cancel a task")
     p_cancel.add_argument("task_id")
+
+    p_artifact = sub.add_parser("artifact", help="download/materialize a task artifact")
+    p_artifact.add_argument("task_id")
+    p_artifact.add_argument("artifact_id")
+    p_artifact.add_argument("--part", type=int, default=0)
+    p_artifact.add_argument("--output-dir", default=".")
+
+    p_watch = sub.add_parser("watch", help="watch a task and update the Kitty tab title")
+    p_watch.add_argument("task_id")
+    p_watch.add_argument("--interval", type=float, default=2.0)
 
     ns = parser.parse_args(args)
     path = _socket_path()
@@ -200,6 +235,18 @@ def main(args: list[str]) -> int:
                     print(line)
             return 0
 
+        if ns.cmd == "remote-list":
+            r = _rpc(path, {"op": "remote_list", "agent": ns.agent,
+                            "context_id": ns.context_id})
+            if not r.get("ok"):
+                _die(f"error: {r.get('error', 'unknown')}")
+            if ns.json:
+                print(json.dumps(r["tasks"], indent=2))
+            else:
+                for task in r["tasks"]:
+                    print(_task_line(task))
+            return 0
+
         if ns.cmd == "agents":
             r = _rpc(path, {"op": "agents"})
             if not r.get("ok"):
@@ -218,12 +265,14 @@ def main(args: list[str]) -> int:
             return 0
 
         if ns.cmd == "submit":
-            msg = " ".join(ns.message).strip()
+            agent = "" if ns.route else ns.agent
+            words = ([ns.agent] if ns.route else []) + ns.message
+            msg = " ".join(words).strip()
             if not msg:
                 _die("submit requires a non-empty message")
             r = _rpc(path, {
                 "op": "submit",
-                "agent": ns.agent,
+                "agent": agent,
                 "message": msg,
                 "cwd": os.getcwd(),
             })
@@ -231,7 +280,8 @@ def main(args: list[str]) -> int:
                 _die(f"error: {r.get('error', 'unknown')}")
             tid = r.get("task_id", "")
             state = r.get("state", "?")
-            print(f"submitted task {tid} to agent '{ns.agent}'")
+            destination = f"agent '{agent}'" if agent else "the project-routed agent"
+            print(f"submitted task {tid} to {destination}")
             print(f"state: {_state_tag(state)}")
             print(f"track with:  kitten a2a.py status {tid}")
             return 0
@@ -252,6 +302,35 @@ def main(args: list[str]) -> int:
                 _die(f"error: {r.get('error', 'unknown')}")
             print(f"cancel requested for {ns.task_id}")
             return 0
+
+
+        if ns.cmd == "artifact":
+            r = _rpc(path, {"op": "artifact.materialize", "task_id": ns.task_id,
+                            "artifact_id": ns.artifact_id, "part": ns.part,
+                            "output_dir": os.path.abspath(ns.output_dir)}, timeout=60.0)
+            if not r.get("ok"):
+                _die(f"error: {r.get('error', 'unknown')}")
+            print(r["path"])
+            return 0
+
+        if ns.cmd == "watch":
+            previous = None
+            terminal = {"COMPLETED", "FAILED", "CANCELED", "REJECTED"}
+            while True:
+                r = _rpc(path, {"op": "status", "task_id": ns.task_id, "refresh": True})
+                if not r.get("ok"):
+                    _die(f"error: {r.get('error', 'unknown')}")
+                task = r["task"]
+                state = task.get("state", "UNKNOWN")
+                if state != previous:
+                    print(_task_line(task), flush=True)
+                    _set_tab_title(f"a2a {state}: {_short(task.get('title', ns.task_id), 40)}")
+                    if state in {"INPUT_REQUIRED", "AUTH_REQUIRED"} or state in terminal:
+                        _notify(f"A2A task {state}", task.get("title", ns.task_id))
+                    previous = state
+                if state in terminal:
+                    return 0 if state == "COMPLETED" else 1
+                time.sleep(max(ns.interval, 0.2))
 
     except A2AError as e:
         _die(str(e))

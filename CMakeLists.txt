@@ -37,6 +37,27 @@ find_package(yaml-cpp REQUIRED)
 # Threads
 find_package(Threads REQUIRED)
 
+# Native A2A gRPC binding. The checked-in proto is the normative v1 schema
+# with documentation-only google.api annotations removed; wire field numbers,
+# messages, and service definitions are unchanged.
+find_package(Protobuf CONFIG REQUIRED)
+find_package(gRPC CONFIG REQUIRED)
+set(A2A_PROTO ${CMAKE_CURRENT_SOURCE_DIR}/proto/a2a.proto)
+set(A2A_PROTO_SRC ${CMAKE_CURRENT_BINARY_DIR}/a2a.pb.cc)
+set(A2A_PROTO_HDR ${CMAKE_CURRENT_BINARY_DIR}/a2a.pb.h)
+set(A2A_GRPC_SRC ${CMAKE_CURRENT_BINARY_DIR}/a2a.grpc.pb.cc)
+set(A2A_GRPC_HDR ${CMAKE_CURRENT_BINARY_DIR}/a2a.grpc.pb.h)
+add_custom_command(
+    OUTPUT ${A2A_PROTO_SRC} ${A2A_PROTO_HDR} ${A2A_GRPC_SRC} ${A2A_GRPC_HDR}
+    COMMAND protobuf::protoc
+    ARGS --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/proto
+         --cpp_out=${CMAKE_CURRENT_BINARY_DIR}
+         --grpc_out=${CMAKE_CURRENT_BINARY_DIR}
+         --plugin=protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>
+         ${A2A_PROTO}
+    DEPENDS ${A2A_PROTO}
+    VERBATIM)
+
 # --- Daemon library (everything except main) ---------------------------------
 add_library(a2ad_core STATIC
     daemon/src/types.cpp
@@ -49,14 +70,19 @@ add_library(a2ad_core STATIC
     daemon/src/IpcServer.cpp
     daemon/src/TaskManager.cpp
     daemon/src/HttpTransport.cpp
+    daemon/src/GrpcTransport.cpp
+    ${A2A_PROTO_SRC}
+    ${A2A_GRPC_SRC}
 )
-target_include_directories(a2ad_core PUBLIC daemon/include)
+target_include_directories(a2ad_core PUBLIC daemon/include PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(a2ad_core PUBLIC
     nlohmann_json::nlohmann_json
     CURL::libcurl
-    SQLite::SQLite3
-    yaml-cpp
+    SQLite3::SQLite3
+    yaml-cpp::yaml-cpp
     Threads::Threads
+    protobuf::libprotobuf
+    gRPC::grpc++
 )
 
 # --- Daemon executable --------------------------------------------------------
@@ -76,8 +102,10 @@ add_executable(a2ad_tests
     tests/daemon/database_test.cpp
     tests/daemon/protocol_test.cpp
     tests/daemon/task_manager_test.cpp
+    tests/daemon/grpc_transport_test.cpp
 )
-target_link_libraries(a2ad_tests PRIVATE a2ad_core)
+target_link_libraries(a2ad_tests PRIVATE a2ad_core gRPC::grpc++)
+target_include_directories(a2ad_tests PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_compile_definitions(a2ad_tests PRIVATE A2AD_TESTING)
 
 add_test(NAME unit COMMAND a2ad_tests)

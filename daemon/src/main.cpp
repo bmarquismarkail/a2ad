@@ -16,6 +16,7 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <algorithm>
 #include <unistd.h>
 
 #include <nlohmann/json.hpp>
@@ -203,9 +204,17 @@ int main(int argc, char** argv) {
         std::string op = req.value("op", "");
         if (op == "submit") {
             CreateTaskRequest r;
-            r.agent = req.value("agent", "");
+            std::string requested_agent = req.value("agent", "");
+            const std::string cwd = req.value("cwd", "");
+            if (requested_agent.empty()) {
+                auto routed = config.default_agent_for(cwd);
+                if (!routed) return {{"ok", false}, {"error", "no agent supplied and no project default matches cwd"},
+                                    {"error_kind", "no_route"}};
+                requested_agent = *routed;
+            }
+            r.agent = requested_agent;
             r.message = req.value("message", "");
-            r.context.cwd = req.value("cwd", "");
+            r.context.cwd = cwd;
             r.continue_task_id = req.value("task_id", "");
             r.continue_context_id = req.value("context_id", "");
             auto resp = tm.createTask(r);
@@ -220,6 +229,15 @@ int main(int argc, char** argv) {
             bool include_terminal = req.value("include_terminal", true);
             nlohmann::json arr = nlohmann::json::array();
             for (const auto& s : tm.listTasks(include_terminal)) arr.push_back(summaryToJson(s));
+            return {{"ok", true}, {"tasks", arr}};
+        }
+        if (op == "remote_list") {
+            auto rr = tm.listRemoteTasks(req.value("agent", ""), req.value("context_id", ""),
+                                         req.value("page_size", 100));
+            if (!rr.ok) return {{"ok", false}, {"error", rr.error},
+                                {"error_kind", error_kind_str(rr.error_kind)}};
+            nlohmann::json arr = nlohmann::json::array();
+            for (const auto& task : rr.tasks) arr.push_back(taskToJson(task));
             return {{"ok", true}, {"tasks", arr}};
         }
         if (op == "status") {
@@ -256,6 +274,13 @@ int main(int argc, char** argv) {
             auto a = tm.discoverAgent(id);
             return {{"ok", true}, {"agent", agentToJson(a)}};
         }
+        if (op == "artifact.materialize") {
+            std::string path, error;
+            if (!tm.materializeArtifact(req.value("task_id", ""), req.value("artifact_id", ""),
+                                        req.value("part", size_t{0}), req.value("output_dir", ""),
+                                        &path, &error)) return {{"ok", false}, {"error", error}};
+            return {{"ok", true}, {"path", path}};
+        }
         if (op == "ping") {
             return {{"ok", true}, {"pong", true}};
         }
@@ -279,6 +304,7 @@ int main(int argc, char** argv) {
 
     // Reconcile non-terminal tasks against their endpoints.
     if (!no_reconcile) tm.reconcileOnStartup();
+    tm.startSubscriptions();
 
     std::fprintf(stderr, "[a2ad] ready: socket=%s db=%s agents=%zu\n",
                  paths.socket.c_str(), paths.db.c_str(), config.agents.size());
@@ -287,8 +313,15 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, onSignal);
     std::signal(SIGCHLD, SIG_IGN);
 
+    auto next_reconcile = std::chrono::steady_clock::now() +
+        std::chrono::seconds(std::max(1, config.ipc.reconcile_interval_sec));
     while (g_running.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if (config.ipc.reconcile_interval_sec > 0 && std::chrono::steady_clock::now() >= next_reconcile) {
+            for (const auto& summary : tm.listTasks(false)) tm.refreshTask(summary.id.value());
+            next_reconcile = std::chrono::steady_clock::now() +
+                std::chrono::seconds(config.ipc.reconcile_interval_sec);
+        }
     }
 
     std::fprintf(stderr, "[a2ad] shutting down\n");

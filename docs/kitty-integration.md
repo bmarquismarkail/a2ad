@@ -75,22 +75,22 @@ map --mode agent f10      kitten a2a.py agents
 
 (Exact key choices are up to the user; the above are placeholders.)
 
-## Tab-title / notification integration (future)
+## Tab-title / notification integration
 
-The daemon broadcasts `task.state_changed` events over the socket. A future
-streaming kitten (or a `kitty @` watcher) can:
+The daemon broadcasts `task.state_changed` events over the socket. The kitten's
+`watch <task-id>` command:
 
-- `kitty @ set-tab-title --match <tab> "⏳ agent: <state>"` on state change,
-- fire a kitty notification when a task reaches `INPUT_REQUIRED` (the agent
-  needs a human answer),
-- highlight the tab when a task `FAILED`.
+- refreshes the task and prints state transitions;
+- calls `kitty @ set-tab-title` on each state change;
+- emits an OSC 99 notification for `INPUT_REQUIRED`, `AUTH_REQUIRED`, and
+  terminal states;
+- exits when the task reaches a terminal state.
 
-This is validated as *available* in Kitty 0.48.2 but is **not wired in v0** —
-the v0 kitten is request/response only.
+The OSC notification path does not require remote-control permission.
 
 ## Remote control prerequisites
 
-`kitty @` (used by the future tab-title integration and by the daemon if it
+`kitty @` (used by the tab-title integration and by the daemon if it
 ever drives the terminal) requires `allow_remote_control = yes` in
 `kitty.conf` and a `kitty` running with a control socket. The v0 daemon does
 **not** call `kitty @`; it only talks to the local IPC socket. No

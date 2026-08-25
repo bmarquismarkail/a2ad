@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <sstream>
 
 namespace fs = std::filesystem;
@@ -49,6 +50,30 @@ std::string error_kind_name(A2AResult::ErrorKind k) {
     }
     return "unknown";
 }
+
+std::optional<std::string> decode_base64(const std::string& input) {
+    static constexpr char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int table[256]; std::fill(std::begin(table), std::end(table), -1);
+    for (int i = 0; i < 64; ++i) table[static_cast<unsigned char>(alphabet[i])] = i;
+    std::string out; int val = 0, bits = -8;
+    for (unsigned char c : input) {
+        if (c == '=') break;
+        if (std::isspace(c)) continue;
+        if (table[c] < 0) return std::nullopt;
+        val = (val << 6) + table[c]; bits += 6;
+        if (bits >= 0) { out.push_back(char((val >> bits) & 0xff)); bits -= 8; }
+    }
+    return out;
+}
+
+std::string safe_filename(std::string name, const Artifact& artifact, size_t index) {
+    name = fs::path(name).filename().string();
+    if (name.empty() || name == "." || name == "..") name = artifact.name;
+    name = fs::path(name).filename().string();
+    if (name.empty()) name = artifact.artifact_id + "-part-" + std::to_string(index);
+    return name;
+}
 }  // namespace
 
 TaskManager::TaskManager(Database& db, std::shared_ptr<A2AClient> a2a, const Config& config)
@@ -69,6 +94,39 @@ TaskManager::TaskManager(Database& db, std::shared_ptr<A2AClient> a2a, const Con
 }
 
 TaskManager::~TaskManager() = default;
+
+void TaskManager::startSubscriptions() {
+    for (const Task& persisted : db_.listNonTerminalTasks()) {
+        startSubscription(persisted);
+    }
+}
+
+void TaskManager::startSubscription(const Task& task) {
+    auto agent = agents_.find(task.agent.value());
+    if (agent == agents_.end() || !agent->second.supports_streaming() || is_terminal(task.state)) return;
+    const std::string task_id = task.id.value();
+    const AgentId agent_id = task.agent;
+    subscriptions_.emplace_back([this, task_id, agent_id](std::stop_token stop) {
+            while (!stop.stop_requested()) {
+                std::string endpoint; AuthSpec auth;
+                if (!resolveEndpoint(agent_id, &endpoint, &auth)) return;
+                a2a_->subscribeToTask(endpoint, auth, TaskId(task_id), [this, task_id](const Task& update) {
+                    auto existing = db_.getTask(task_id);
+                    if (!existing) return;
+                    Task merged = update;
+                    if (merged.id.empty()) merged.id = existing->id;
+                    merged.agent = existing->agent; merged.title = existing->title;
+                    merged.cwd = existing->cwd; merged.created_at = existing->created_at;
+                    merged.updated_at = now_iso();
+                    db_.updateTask(merged);
+                    emitStateChanged(task_id, existing->state, merged.state);
+                }, stop);
+                if (stop.stop_requested()) return;
+                for (int i = 0; i < 20 && !stop.stop_requested(); ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+    });
+}
 
 bool TaskManager::resolveEndpoint(const AgentId& id, std::string* endpoint, AuthSpec* auth) const {
     auto it = agents_.find(id.value());
@@ -184,6 +242,7 @@ CreateTaskResponse TaskManager::createTask(const CreateTaskRequest& req) {
     t.last_state_change = now_iso();
 
     db_.insertTask(t);
+    startSubscription(t);
 
     resp.ok = true;
     resp.task_id = t.id;
@@ -308,6 +367,60 @@ std::vector<TaskSummary> TaskManager::listTasks(bool include_terminal) {
         out.push_back(std::move(s));
     }
     return out;
+}
+
+A2AResult TaskManager::listRemoteTasks(const std::string& agent, const std::string& context_id,
+                                       int page_size) {
+    std::string endpoint; AuthSpec auth;
+    if (!resolveEndpoint(AgentId(agent), &endpoint, &auth)) {
+        A2AResult r; r.error_kind = A2AResult::ErrorKind::ProtocolError;
+        r.error = "unknown agent: " + agent; return r;
+    }
+    A2AResult r = a2a_->listTasks(endpoint, auth, context_id, page_size);
+    if (r.ok) for (auto& task : r.tasks) if (task.agent.empty()) task.agent = agent;
+    return r;
+}
+
+bool TaskManager::materializeArtifact(const std::string& task_id, const std::string& artifact_id,
+                                      size_t part_index, const std::string& output_dir,
+                                      std::string* output_path, std::string* error) {
+    auto task = db_.getTask(task_id);
+    if (!task) { if (error) *error = "no such task: " + task_id; return false; }
+    auto it = std::find_if(task->artifacts.begin(), task->artifacts.end(),
+                           [&](const Artifact& a) { return a.artifact_id == artifact_id; });
+    if (it == task->artifacts.end()) { if (error) *error = "no such artifact: " + artifact_id; return false; }
+    if (part_index >= it->parts.size()) { if (error) *error = "artifact part index out of range"; return false; }
+    const Part& part = it->parts[part_index];
+    std::string bytes;
+    if (!part.raw_b64.empty()) {
+        auto decoded = decode_base64(part.raw_b64);
+        if (!decoded) { if (error) *error = "invalid base64 artifact data"; return false; }
+        bytes = std::move(*decoded);
+    } else if (!part.text.empty()) bytes = part.text;
+    else if (!part.data.empty()) bytes = part.data;
+    else if (!part.url.empty()) {
+        std::string endpoint; AuthSpec auth;
+        if (!resolveEndpoint(task->agent, &endpoint, &auth)) { if (error) *error = "unknown task agent"; return false; }
+        auto response = a2a_->download(part.url, auth);
+        if (response.transport_error || response.status < 200 || response.status >= 300) {
+            if (error) *error = response.transport_error ? response.transport_error_detail
+                                                        : "artifact download returned HTTP " + std::to_string(response.status);
+            return false;
+        }
+        bytes = std::move(response.body);
+    } else { if (error) *error = "artifact part has no materializable content"; return false; }
+
+    fs::path dir = output_dir.empty() ? fs::current_path() : fs::path(output_dir);
+    std::error_code ec; fs::create_directories(dir, ec);
+    if (ec) { if (error) *error = "cannot create output directory: " + ec.message(); return false; }
+    fs::path path = dir / safe_filename(part.filename, *it, part_index);
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out || !out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()))) {
+        if (error) *error = "cannot write artifact: " + path.string();
+        return false;
+    }
+    if (output_path) *output_path = fs::absolute(path).lexically_normal().string();
+    return true;
 }
 
 std::optional<Task> TaskManager::getTask(const std::string& id) {

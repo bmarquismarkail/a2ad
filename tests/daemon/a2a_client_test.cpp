@@ -105,6 +105,40 @@ ADD_TEST(parse_direct_task_result) {
     }
 }
 
+ADD_TEST(list_tasks_parses_remote_collection) {
+    auto mt = std::make_shared<MockTransport>();
+    auto creds = make_credential_provider();
+    A2AClient client(mt, std::shared_ptr<CredentialProvider>(std::move(creds)));
+    mt->queue.push_back({200, R"({"jsonrpc":"2.0","id":"1","result":{"tasks":[
+      {"id":"one","status":{"state":"TASK_STATE_WORKING"}},
+      {"id":"two","status":{"state":"TASK_STATE_COMPLETED"}}
+    ]}})", false, ""});
+    auto result = client.listTasks("http://agent/a2a", AuthSpec{}, "ctx", 25);
+    CHECK(result.ok);
+    CHECK_EQ(result.tasks.size(), size_t{2});
+    CHECK_EQ(result.tasks[0].id.value(), std::string("one"));
+    CHECK_EQ(result.tasks[1].state, TaskState::Completed);
+    auto body = nlohmann::json::parse(mt->last_body);
+    CHECK_EQ(body["method"].get<std::string>(), std::string("ListTasks"));
+    CHECK_EQ(body["params"]["contextId"].get<std::string>(), std::string("ctx"));
+    CHECK_EQ(body["params"]["pageSize"].get<int>(), 25);
+}
+
+ADD_TEST(subscribe_parses_sse_task_update) {
+    auto mt = std::make_shared<MockTransport>();
+    auto creds = make_credential_provider();
+    A2AClient client(mt, std::shared_ptr<CredentialProvider>(std::move(creds)));
+    mt->queue.push_back({200,
+        "data: {\"result\":{\"task\":{\"id\":\"streamed\",\"status\":{\"state\":\"TASK_STATE_INPUT_REQUIRED\"}}}}\n\n",
+        false, ""});
+    std::optional<Task> update;
+    auto result = client.subscribeToTask("http://agent/a2a", AuthSpec{}, TaskId("streamed"),
+                                         [&](const Task& task) { update = task; });
+    CHECK(result.ok);
+    CHECK(update.has_value());
+    if (update) CHECK_EQ(update->state, TaskState::InputRequired);
+}
+
 ADD_TEST(parse_direct_message_result) {
     auto mt = std::make_shared<MockTransport>();
     auto creds = make_credential_provider();

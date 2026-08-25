@@ -99,15 +99,45 @@ Implementation order, each unit compile-checked in isolation before the next:
 - `a2ad_e2e`: **15 assertions, 0 failures** — full submit→list→status→
   respond→cancel round-trip against the mock server.
 
-## Future milestones (not yet built)
+## Milestone 6 — Streaming, remote listing, and routing (done)
 
-- SSE subscription (`SubscribeToTask`) for push state changes instead of
-  polling.
-- `ListTasks` as an IPC op (remote agent task listing).
-- gRPC and REST bindings (JSON-RPC only today).
-- Artifact download / file materialization.
-- Multi-agent routing policies and per-project `default_agent` enforcement in
-  `submit` (currently `submit` requires an explicit `agent`).
-- `kitty @` tab-title / notification integration for state changes (the
-  keyboard-mode and `set-tab-title` commands were validated but not yet wired
-  into the kitten).
+- `SubscribeToTask` uses a long-lived SSE request, parses events incrementally,
+  persists each task update, broadcasts state changes over IPC, and reconnects
+  with bounded backoff. Shutdown interrupts idle libcurl streams cleanly.
+- `remote_list` exposes the remote agent's A2A `ListTasks` operation separately
+  from the daemon's persisted `list`; context and page-size filters are passed
+  through.
+- `submit` accepts an omitted agent and enforces longest-prefix project routing.
+  The kitten exposes this as `submit --route ...`; an explicit agent continues
+  to override the project default.
+- Periodic reconciliation (`ipc.reconcile_interval_sec`) is active as a polling
+  fallback for agents that do not advertise streaming.
+
+## Milestone 7 — Binding negotiation and artifacts (done)
+
+- Agent Card interface negotiation honors the server's preferred-interface
+  ordering across JSON-RPC, HTTP+JSON, and gRPC.
+- The HTTP+JSON/REST binding implements the v1.0 operation paths and media type
+  for send, get, list, cancel, and SSE subscribe.
+- `artifact.materialize` writes structured artifact parts without scraping
+  terminal output. Text, structured JSON, base64 raw data, and authenticated
+  artifact URLs are supported; filenames are confined to the requested output
+  directory.
+- The native gRPC binding uses the gRPC C++ runtime and build-generated sources
+  from the checked-in A2A v1 Protobuf schema. Send, get, list, cancel, and
+  server-streaming subscribe are supported, including TLS, credentials,
+  deadlines, cancellation, and gRPC status classification.
+
+## Milestone 8 — Kitty state integration (done)
+
+- `watch` refreshes a task, prints state transitions, updates the current Kitty
+  tab title through remote control, and emits OSC 99 notifications for
+  interrupted and terminal states.
+- `remote-list` and `artifact` expose the new daemon operations.
+
+## Milestone 9 — Final verification (done)
+
+- Native gRPC operations are exercised against an in-process HTTP/2/Protobuf
+  server, including a server-streaming subscription.
+- Unit tests: **194 assertions, 0 failures**.
+- Full CTest: **3/3 suites passed** (`unit`, IPC end-to-end, daemon mode).

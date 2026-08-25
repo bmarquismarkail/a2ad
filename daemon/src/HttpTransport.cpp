@@ -26,6 +26,17 @@ size_t writeCb(void* data, size_t size, size_t nmemb, void* userp) {
     out->append(static_cast<char*>(data), size * nmemb);
     return size * nmemb;
 }
+
+struct StreamContext { const std::function<bool(std::string_view)>* callback; };
+size_t streamCb(void* data, size_t size, size_t nmemb, void* userp) {
+    const size_t bytes = size * nmemb;
+    auto* ctx = static_cast<StreamContext*>(userp);
+    return (*ctx->callback)(std::string_view(static_cast<char*>(data), bytes)) ? bytes : 0;
+}
+int progressCb(void* userp, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+    auto* ctx = static_cast<StreamContext*>(userp);
+    return (*ctx->callback)(std::string_view{}) ? 0 : 1;
+}
 }  // namespace
 
 CurlTransport::CurlTransport(int timeout_ms, std::string user_agent)
@@ -100,6 +111,41 @@ HttpResponse CurlTransport::request(const std::string& endpoint, const std::stri
     }
     r.status = (int)http_code;
     r.body = std::move(resp_body);
+    return r;
+}
+
+HttpResponse CurlTransport::stream(const std::string& endpoint, const std::string& method,
+                                   const std::string& path, const std::string& body,
+                                   const std::vector<std::pair<std::string, std::string>>& headers,
+                                   const std::function<bool(std::string_view)>& on_chunk) {
+    HttpResponse r;
+    std::string url = endpoint;
+    if (!path.empty()) { if (url.back() != '/') url += '/'; url += path.front() == '/' ? path.substr(1) : path; }
+    CURL* curl = curl_easy_init();
+    if (!curl) { r.transport_error = true; r.transport_error_detail = "curl_easy_init failed"; return r; }
+    curl_slist* hdrs = nullptr;
+    for (const auto& [key, value] : headers) hdrs = curl_slist_append(hdrs, (key + ": " + value).c_str());
+    StreamContext context{&on_chunk};
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, streamCb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &context);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, progressCb);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &context);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(curl, CURLOPT_POST, method == "POST" ? 1L : 0L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(timeout_ms_ / 2));
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 0L); // SSE is intentionally long-lived
+    CURLcode code = curl_easy_perform(curl);
+    long status = 0; curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    if (code != CURLE_OK && code != CURLE_WRITE_ERROR) {
+        r.transport_error = true; r.transport_error_detail = curl_easy_strerror(code);
+    }
+    r.status = static_cast<int>(status);
+    if (hdrs) curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
     return r;
 }
 

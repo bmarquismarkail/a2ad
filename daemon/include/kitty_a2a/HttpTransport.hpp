@@ -18,6 +18,10 @@ public:
     HttpResponse request(const std::string& endpoint, const std::string& method,
                          const std::string& path, const std::string& body,
                          const std::vector<std::pair<std::string, std::string>>& headers) override;
+    HttpResponse stream(const std::string& endpoint, const std::string& method,
+                        const std::string& path, const std::string& body,
+                        const std::vector<std::pair<std::string, std::string>>& headers,
+                        const std::function<bool(std::string_view)>& on_chunk) override;
 
 private:
     int timeout_ms_;
