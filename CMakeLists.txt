@@ -75,6 +75,7 @@ add_executable(a2ad_tests
     tests/daemon/credentials_test.cpp
     tests/daemon/database_test.cpp
     tests/daemon/protocol_test.cpp
+    tests/daemon/task_manager_test.cpp
 )
 target_link_libraries(a2ad_tests PRIVATE a2ad_core)
 target_compile_definitions(a2ad_tests PRIVATE A2AD_TESTING)
@@ -88,6 +89,12 @@ target_link_libraries(a2ad_e2e PRIVATE a2ad_core)
 target_compile_definitions(a2ad_e2e PRIVATE A2AD_BIN="${CMAKE_BINARY_DIR}/a2ad")
 add_test(NAME e2e COMMAND a2ad_e2e)
 set_tests_properties(e2e PROPERTIES TIMEOUT 60)
+
+# Integration test: the default double-fork mode retains a working IPC server.
+add_executable(a2ad_daemon_mode_test tests/ipc/daemon_mode.cpp)
+target_compile_definitions(a2ad_daemon_mode_test PRIVATE A2AD_BIN="${CMAKE_BINARY_DIR}/a2ad")
+add_test(NAME daemon_mode COMMAND a2ad_daemon_mode_test)
+set_tests_properties(daemon_mode PROPERTIES TIMEOUT 30)
 
 install(TARGETS a2ad RUNTIME DESTINATION bin)
 install(FILES kitten/a2a.py DESTINATION ${CMAKE_INSTALL_PREFIX}/share/kitty/kittens)

@@ -144,7 +144,7 @@ Message A2AClient::parseMessage(const nlohmann::json& j) {
 }
 
 std::optional<Task> A2AClient::parseTask(const nlohmann::json& j) {
-    if (!j.is_object() || !j.contains("id")) return std::nullopt;
+    if (!j.is_object() || !j.contains("id") || !j["id"].is_string()) return std::nullopt;
     Task t;
     t.id = j["id"].get<std::string>();
     if (j.contains("contextId")) t.context = j["contextId"].get<std::string>();
@@ -237,9 +237,27 @@ A2AResult A2AClient::rpcCall(const std::string& endpoint, const AuthSpec& auth,
     }
 
     const auto& result = j["result"];
-    // A result is a Task or a Message per A2A.
-    if (result.contains("task") && result["task"].is_object()) {
-        auto t = parseTask(result["task"]);
+    // A result is a Task or a Message per A2A. Accept the standard direct
+    // result as well as wrappers used by older/mixed-version agents.
+    const J* task_result = nullptr;
+    const J* message_result = nullptr;
+    if (result.is_object()) {
+        if (result.contains("task") && result["task"].is_object()) {
+            task_result = &result["task"];
+        } else if (result.contains("message") && result["message"].is_object()) {
+            message_result = &result["message"];
+        } else if (result.contains("id") && result["id"].is_string() &&
+                   result.contains("status") && result["status"].is_object()) {
+            task_result = &result;
+        } else if (result.contains("messageId") && result["messageId"].is_string() &&
+                   result.contains("role") && result["role"].is_string() &&
+                   result.contains("parts") && result["parts"].is_array()) {
+            message_result = &result;
+        }
+    }
+
+    if (task_result) {
+        auto t = parseTask(*task_result);
         if (!t) {
             out.ok = false;
             out.error_kind = A2AResult::ErrorKind::MalformedResponse;
@@ -256,11 +274,23 @@ A2AResult A2AClient::rpcCall(const std::string& endpoint, const AuthSpec& auth,
             out.error_kind = A2AResult::ErrorKind::TaskFailure;
             out.error = "remote task ended in " + to_state_string(out.task->state);
         }
-    } else if (result.contains("message") && result["message"].is_object()) {
+    } else if (message_result) {
+        if (!message_result->contains("messageId") || !(*message_result)["messageId"].is_string() ||
+            !message_result->contains("role") || !(*message_result)["role"].is_string() ||
+            !message_result->contains("parts") || !(*message_result)["parts"].is_array()) {
+            out.ok = false;
+            out.error_kind = A2AResult::ErrorKind::MalformedResponse;
+            out.error = "malformed message in A2A result";
+            return out;
+        }
         out.ok = true;
-        Message m = parseMessage(result["message"]);
+        Message m = parseMessage(*message_result);
         out.message_text = m.text();
         out.context_id = m.context_id.value();
+    } else {
+        out.ok = false;
+        out.error_kind = A2AResult::ErrorKind::MalformedResponse;
+        out.error = "A2A result is neither a Task nor a Message";
     }
     return out;
 }

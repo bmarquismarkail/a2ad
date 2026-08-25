@@ -102,7 +102,7 @@ private:
     A2AResult rpcCall(const std::string& endpoint, const AuthSpec& auth,
                       const std::string& method, const std::string& params_json);
 
-    // Parse a Task object (from result.task) into our internal Task.
+    // Parse a direct or compatibility-wrapped Task result into our internal Task.
     static std::optional<Task> parseTask(const nlohmann::json& j);
     // Parse a Part / Message / Artifact from JSON (A2A 1.0 camelCase wire).
     static Part parsePart(const nlohmann::json& j);

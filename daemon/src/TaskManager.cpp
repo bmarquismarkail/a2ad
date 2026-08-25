@@ -107,6 +107,7 @@ void TaskManager::reconcileOnStartup() {
             if (fresh.title.empty()) fresh.title = t.title;
             if (fresh.cwd.empty()) fresh.cwd = t.cwd;
             if (fresh.created_at.empty()) fresh.created_at = t.created_at;
+            fresh.agent = t.agent;
             fresh.updated_at = now_iso();
             db_.updateTask(fresh);
             std::fprintf(stderr, "[a2ad] reconcile: task %s now %s\n",

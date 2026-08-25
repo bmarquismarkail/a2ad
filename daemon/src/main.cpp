@@ -156,6 +156,21 @@ int main(int argc, char** argv) {
     if (!config.ipc.socket.empty()) paths.socket = config.ipc.socket;
     if (!config.ipc.db.empty()) paths.db = config.ipc.db;
 
+    if (!foreground) {
+        // Daemonize before opening SQLite or constructing anything that may
+        // own worker threads. Only the calling thread survives fork().
+        pid_t pid = fork();
+        if (pid < 0) { std::perror("fork"); return 1; }
+        if (pid > 0) return 0;   // parent exits
+        if (setsid() < 0) { /* warn */ }
+        pid = fork();
+        if (pid < 0) { std::perror("fork"); return 1; }
+        if (pid > 0) return 0;   // first child exits
+        // Second child: redirect std fds to /dev/null.
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) { dup2(devnull, 0); dup2(devnull, 1); dup2(devnull, 2); }
+    }
+
     // Open database.
     Database db;
     std::string db_err;
@@ -267,20 +282,6 @@ int main(int argc, char** argv) {
 
     std::fprintf(stderr, "[a2ad] ready: socket=%s db=%s agents=%zu\n",
                  paths.socket.c_str(), paths.db.c_str(), config.agents.size());
-
-    if (!foreground) {
-        // Minimal double-fork daemonize.
-        pid_t pid = fork();
-        if (pid < 0) { std::perror("fork"); return 1; }
-        if (pid > 0) return 0;   // parent exits
-        if (setsid() < 0) { /* warn */ }
-        pid = fork();
-        if (pid < 0) { std::perror("fork"); return 1; }
-        if (pid > 0) return 0;   // first child exits
-        // Second child: redirect std fds to /dev/null.
-        int devnull = open("/dev/null", O_RDWR);
-        if (devnull >= 0) { dup2(devnull, 0); dup2(devnull, 1); dup2(devnull, 2); }
-    }
 
     std::signal(SIGTERM, onSignal);
     std::signal(SIGINT, onSignal);

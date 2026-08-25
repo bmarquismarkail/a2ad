@@ -78,6 +78,87 @@ ADD_TEST(parse_task_from_wire) {
     CHECK_EQ(body["params"]["id"].get<std::string>(), std::string("task-1"));
 }
 
+ADD_TEST(parse_direct_task_result) {
+    auto mt = std::make_shared<MockTransport>();
+    auto creds = make_credential_provider();
+    auto creds_shared = std::shared_ptr<CredentialProvider>(std::move(creds));
+    A2AClient client(mt, creds_shared);
+    mt->queue.push_back(HttpResponse{200, R"({
+      "jsonrpc":"2.0","id":"1","result":{
+        "id":"task-direct","contextId":"ctx-direct",
+        "status":{"state":"TASK_STATE_COMPLETED","message":"done"},
+        "history":[{"messageId":"m1","role":"ROLE_AGENT","parts":[{"text":"finished"}]}],
+        "artifacts":[{"artifactId":"a1","name":"result.txt","parts":[{"text":"ok"}]}]
+      }
+    })", false, ""});
+
+    AuthSpec auth;
+    auto r = client.getTask("http://x", auth, TaskId("task-direct"));
+    CHECK(r.ok);
+    CHECK(r.task.has_value());
+    if (r.task) {
+        CHECK_EQ(r.task->id.value(), std::string("task-direct"));
+        CHECK_EQ(r.task->context.value(), std::string("ctx-direct"));
+        CHECK_EQ(r.task->state, TaskState::Completed);
+        CHECK_EQ(r.task->messages.size(), (size_t)1);
+        CHECK_EQ(r.task->artifacts.size(), (size_t)1);
+    }
+}
+
+ADD_TEST(parse_direct_message_result) {
+    auto mt = std::make_shared<MockTransport>();
+    auto creds = make_credential_provider();
+    auto creds_shared = std::shared_ptr<CredentialProvider>(std::move(creds));
+    A2AClient client(mt, creds_shared);
+    mt->queue.push_back(HttpResponse{200, R"({
+      "jsonrpc":"2.0","id":"1","result":{
+        "messageId":"message-direct","role":"ROLE_AGENT","contextId":"ctx-message",
+        "parts":[{"text":"direct reply"}]
+      }
+    })", false, ""});
+
+    AuthSpec auth;
+    auto r = client.sendMessage("http://x", auth, "hello", TaskId(), ContextId());
+    CHECK(r.ok);
+    CHECK(!r.task.has_value());
+    CHECK_EQ(r.message_text, std::string("direct reply"));
+    CHECK_EQ(r.context_id, std::string("ctx-message"));
+}
+
+ADD_TEST(parse_wrapped_message_result) {
+    auto mt = std::make_shared<MockTransport>();
+    auto creds = make_credential_provider();
+    auto creds_shared = std::shared_ptr<CredentialProvider>(std::move(creds));
+    A2AClient client(mt, creds_shared);
+    mt->queue.push_back(HttpResponse{200, R"({
+      "jsonrpc":"2.0","id":"1","result":{"message":{
+        "messageId":"message-wrapped","role":"ROLE_AGENT","contextId":"ctx-wrapped",
+        "parts":[{"text":"wrapped reply"}]
+      }}
+    })", false, ""});
+
+    AuthSpec auth;
+    auto r = client.sendMessage("http://x", auth, "hello", TaskId(), ContextId());
+    CHECK(r.ok);
+    CHECK_EQ(r.message_text, std::string("wrapped reply"));
+    CHECK_EQ(r.context_id, std::string("ctx-wrapped"));
+}
+
+ADD_TEST(unrecognized_result_is_malformed) {
+    auto mt = std::make_shared<MockTransport>();
+    auto creds = make_credential_provider();
+    auto creds_shared = std::shared_ptr<CredentialProvider>(std::move(creds));
+    A2AClient client(mt, creds_shared);
+    mt->queue.push_back(HttpResponse{200,
+        R"({"jsonrpc":"2.0","id":"1","result":{"unexpected":true}})", false, ""});
+
+    AuthSpec auth;
+    auto r = client.getTask("http://x", auth, TaskId("task"));
+    CHECK(!r.ok);
+    CHECK_EQ(r.error_kind, A2AResult::ErrorKind::MalformedResponse);
+    CHECK(r.error.find("neither a Task nor a Message") != std::string::npos);
+}
+
 ADD_TEST(auth_failure_classification) {
     auto mt = std::make_shared<MockTransport>();
     auto creds = make_credential_provider();
