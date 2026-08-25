@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <poll.h>
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
@@ -57,7 +58,12 @@ IpcServer::~IpcServer() { stop(); }
 bool IpcServer::start(std::string* error) {
     // Remove any stale socket from a previous run.
     if (fs::exists(socket_path_)) {
-        fs::remove(socket_path_);
+        std::error_code remove_error;
+        fs::remove(socket_path_, remove_error);
+        if (remove_error) {
+            if (error) *error = "cannot remove stale socket " + socket_path_ + ": " + remove_error.message();
+            return false;
+        }
     }
     // Ensure the parent directory exists (0700 so the socket isn't exposed).
     auto parent = fs::path(socket_path_).parent_path();
@@ -102,6 +108,19 @@ bool IpcServer::start(std::string* error) {
 
 void IpcServer::acceptLoop() {
     while (running_.load()) {
+        pollfd ready{impl_->listen_fd, POLLIN, 0};
+        int polled = ::poll(&ready, 1, -1);
+        if (polled < 0) {
+            if (errno == EINTR) continue;
+            if (running_.load()) continue;
+            break;
+        }
+        if (!running_.load()) break;
+        if (!(ready.revents & POLLIN)) {
+            // POLLNVAL/POLLHUP is expected when stop() closes the listener.
+            if (ready.revents & (POLLNVAL | POLLHUP | POLLERR)) break;
+            continue;
+        }
         int cfd = ::accept(impl_->listen_fd, nullptr, nullptr);
         if (cfd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
@@ -202,7 +221,8 @@ void IpcServer::stop() {
     for (int cfd : impl_->clients) ::close(cfd);
     impl_->clients.clear();
 
-    fs::remove(socket_path_);
+    std::error_code ec;
+    fs::remove(socket_path_, ec);
 }
 
 }  // namespace kitty_a2a

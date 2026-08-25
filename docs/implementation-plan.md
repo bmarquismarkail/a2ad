@@ -139,5 +139,6 @@ Implementation order, each unit compile-checked in isolation before the next:
 
 - Native gRPC operations are exercised against an in-process HTTP/2/Protobuf
   server, including a server-streaming subscription.
-- Unit tests: **194 assertions, 0 failures**.
+- Unit tests: **196 assertions, 0 failures**, including an idle-CPU regression
+  check for the IPC listener.
 - Full CTest: **3/3 suites passed** (`unit`, IPC end-to-end, daemon mode).

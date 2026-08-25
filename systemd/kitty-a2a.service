@@ -8,8 +8,11 @@ After=default.target
 Type=simple
 # User is filled in at install time: systemd --user units run as the invoking
 # user by default, but we set it explicitly for clarity.
-ExecStart=/usr/local/bin/a2ad --config %h/.config/kitty-a2a/agents.yaml
-# If you want the reconcile loop, add --reconcile 5 to ExecStart.
+# Type=simple requires a2ad to remain in the foreground. Without this flag the
+# daemon double-forks, the tracked parent exits, and systemd tears down the
+# service cgroup as soon as startup appears to finish.
+ExecStart=/usr/local/bin/a2ad --foreground --config %h/.config/kitty-a2a/agents.yaml
+# Configure periodic polling with ipc.reconcile_interval_sec in agents.yaml.
 Restart=on-failure
 RestartSec=2
 
@@ -18,6 +21,14 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
+# SQLite state is the sole writable home-directory path. Keep the rest of the
+# home tree read-only while allowing a2ad to update its task registry.
+ReadWritePaths=%h/.local/state/kitty-a2a
+# Let systemd create the same directory selected by Paths::resolve() under
+# XDG_RUNTIME_DIR and keep the socket writable inside the service namespace.
+RuntimeDirectory=kitty-a2a
+RuntimeDirectoryMode=0700
+ReadWritePaths=%t/kitty-a2a
 
 [Install]
 WantedBy=default.target

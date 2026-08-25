@@ -103,6 +103,7 @@ add_executable(a2ad_tests
     tests/daemon/protocol_test.cpp
     tests/daemon/task_manager_test.cpp
     tests/daemon/grpc_transport_test.cpp
+    tests/daemon/ipc_server_test.cpp
 )
 target_link_libraries(a2ad_tests PRIVATE a2ad_core gRPC::grpc++)
 target_include_directories(a2ad_tests PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
