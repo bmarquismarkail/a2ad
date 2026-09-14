@@ -80,6 +80,7 @@ struct HttpResponse {
     std::string body;
     bool transport_error = false;   // connection failed / TLS error, etc.
     std::string transport_error_detail;
+    std::map<std::string, std::string> headers = {}; // lowercase response header names
 };
 class HttpTransport {
 public:
@@ -130,7 +131,8 @@ public:
     // `task_id`/`context_id` may be empty for a fresh conversation.
     A2AResult sendMessage(const std::string& endpoint, const AuthSpec& auth,
                           const std::string& message_text,
-                          const TaskId& task_id, const ContextId& context_id);
+                          const TaskId& task_id, const ContextId& context_id,
+                          const std::string& message_id = {});
     A2AResult sendStreamingMessage(const std::string& endpoint, const AuthSpec& auth,
                           const std::string& message_text, const TaskId& task_id,
                           const ContextId& context_id,
@@ -192,6 +194,9 @@ private:
     std::shared_ptr<HttpTransport> transport_;
     std::shared_ptr<CredentialProvider> creds_;
     Options opts_;
+    std::mutex discovery_mutex_;
+    struct CachedCard { std::string body; std::string etag; };
+    std::map<std::string, CachedCard> card_cache_;
     std::mutex bindings_mutex_;
     struct BindingInfo { std::string binding = "JSONRPC"; std::string version = "1.0"; std::string tenant; };
     std::map<std::string, BindingInfo> bindings_; // interface URL -> selected wire information

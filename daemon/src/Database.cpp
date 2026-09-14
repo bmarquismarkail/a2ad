@@ -81,10 +81,12 @@ bool Database::open(const std::string& path, std::string* error) {
         }
         sqlite3_finalize(st); return found;
     };
+    const bool legacy_remote_ids = !has_column("remote_task_id");
     if (sqlite3_exec(impl_->db, "BEGIN IMMEDIATE", nullptr, nullptr, &err) != SQLITE_OK ||
-        (!has_column("remote_task_id") && sqlite3_exec(impl_->db, "ALTER TABLE tasks ADD COLUMN remote_task_id TEXT", nullptr, nullptr, &err) != SQLITE_OK) ||
+        (legacy_remote_ids && sqlite3_exec(impl_->db, "ALTER TABLE tasks ADD COLUMN remote_task_id TEXT", nullptr, nullptr, &err) != SQLITE_OK) ||
         (!has_column("metadata") && sqlite3_exec(impl_->db, "ALTER TABLE tasks ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'", nullptr, nullptr, &err) != SQLITE_OK) ||
-        sqlite3_exec(impl_->db, "UPDATE tasks SET remote_task_id=id WHERE remote_task_id IS NULL; DELETE FROM schema_version; INSERT INTO schema_version(version) VALUES(2); COMMIT", nullptr, nullptr, &err) != SQLITE_OK) {
+        (legacy_remote_ids && sqlite3_exec(impl_->db, "UPDATE tasks SET remote_task_id=id WHERE remote_task_id IS NULL", nullptr, nullptr, &err) != SQLITE_OK) ||
+        sqlite3_exec(impl_->db, "DELETE FROM schema_version; INSERT INTO schema_version(version) VALUES(2); COMMIT", nullptr, nullptr, &err) != SQLITE_OK) {
         std::string msg = err ? err : "unknown"; if (err) sqlite3_free(err);
         sqlite3_exec(impl_->db, "ROLLBACK", nullptr, nullptr, nullptr);
         if (error) *error = "schema migration failed: " + msg;

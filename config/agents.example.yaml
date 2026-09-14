@@ -54,3 +54,9 @@ ipc:
   # Optional: poll non-terminal tasks every N seconds and emit
   # `task.state_changed` events so a watching tab updates live. 0 = disabled.
   reconcile_interval_sec: 5
+
+# Existing configs retain ungated compatibility mode. Set true to require
+# approval of each exact mutating IPC request before dispatch. Explicit
+# effects always request approval, even in compatibility mode.
+policy:
+  enforce: false

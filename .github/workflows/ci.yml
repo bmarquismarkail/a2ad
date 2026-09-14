@@ -1,0 +1,17 @@
+name: Build and test
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ pkg-config nlohmann-json3-dev libcurl4-openssl-dev libsqlite3-dev libssl-dev libyaml-cpp-dev libprotobuf-dev protobuf-compiler libgrpc++-dev protobuf-compiler-grpc
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+      - run: cmake --build build --parallel 2
+      - run: ctest --test-dir build --output-on-failure
+      - run: python3 -m py_compile kitten/a2a.py

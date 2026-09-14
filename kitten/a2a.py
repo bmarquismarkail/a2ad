@@ -28,6 +28,7 @@ import sys
 import tempfile
 import time
 import subprocess
+import uuid
 
 STATE_COLORS = {
     "WORKING": "\033[34m",       # blue
@@ -68,6 +69,9 @@ class A2AError(RuntimeError):
 
 def _rpc(path: str, payload: dict, timeout: float = 10.0) -> dict:
     """Send one NDJSON request, read one NDJSON response. Raises A2AError."""
+    payload = dict(payload)
+    if payload.get("op") in {"submit", "respond", "cancel", "stream_submit", "push.create", "push.delete", "artifact.materialize"}:
+        payload.setdefault("request_id", uuid.uuid4().hex)
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         sock.settimeout(timeout)
@@ -253,10 +257,42 @@ def main(args: list[str]) -> int:
     p_watch.add_argument("task_id")
     p_watch.add_argument("--interval", type=float, default=2.0)
 
+    p_control = sub.add_parser("control", help="send a control-plane JSON request; '-' reads stdin")
+    p_control.add_argument("request")
+    p_events = sub.add_parser("events", help="read a durable event channel, acknowledging displayed events")
+    p_events.add_argument("--channel", required=True, help="stable frontend identity, reused across restarts")
+    p_events.add_argument("--follow", action="store_true")
+    p_events.add_argument("--limit", type=int, default=100)
+
     ns = parser.parse_args(_command_args(args))
     path = _socket_path()
 
     try:
+        if ns.cmd == "control":
+            request = json.loads(sys.stdin.read() if ns.request == "-" else ns.request)
+            if not isinstance(request, dict):
+                _die("control request must be a JSON object")
+            result = _rpc(path, request, timeout=60.0)
+            print(json.dumps(result, indent=2), flush=True)
+            return 0 if result.get("ok") else 1
+        if ns.cmd == "events":
+            opened = _rpc(path, {"op": "channel.open", "id": ns.channel})
+            if not opened.get("ok"):
+                _die(opened.get("error", "cannot open channel"))
+            while True:
+                page = _rpc(path, {"op": "channel.read", "id": ns.channel, "limit": ns.limit})
+                if not page.get("ok"):
+                    _die(page.get("error", "cannot read channel"))
+                for event in page["events"]:
+                    print(json.dumps(event), flush=True)
+                ack = _rpc(path, {"op": "channel.ack", "id": ns.channel, "cursor": page["next_cursor"]})
+                if not ack.get("ok"):
+                    _die(ack.get("error", "cannot acknowledge channel"))
+                if page.get("may_have_more"):
+                    continue
+                if not ns.follow:
+                    return 0
+                time.sleep(0.5)
         if ns.cmd == "list":
             r = _rpc(path, {"op": "list", "include_terminal": ns.all})
             if not r.get("ok"):

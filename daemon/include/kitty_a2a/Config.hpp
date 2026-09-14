@@ -73,6 +73,8 @@ struct Config {
     std::map<std::string, AgentConfig> agents;
     std::vector<ProjectRule> projects; // kept as-is; matched at routing time
     IpcConfig ipc;
+    // Opt-in for existing installations; explicit effects always require approval.
+    bool enforce_policy = false;
 
     // Longest matching project path for cwd; returns the default_agent id, or
     // std::nullopt. Ties broken by longer (more specific) path first.

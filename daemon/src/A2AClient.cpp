@@ -103,8 +103,12 @@ AgentCard A2AClient::discover(const std::string& endpoint) {
     }
 
     for (const auto& url : candidates) {
-        HttpResponse r = transport_->request(url, "GET", "", {},
-            {{"Accept", "application/json"}, {"User-Agent", opts_.user_agent}});
+        CachedCard cached;
+        { std::lock_guard lock(discovery_mutex_); auto it = card_cache_.find(url); if (it != card_cache_.end()) cached = it->second; }
+        std::vector<std::pair<std::string, std::string>> headers = {{"Accept", "application/json"}, {"User-Agent", opts_.user_agent}};
+        if (!cached.etag.empty()) headers.emplace_back("If-None-Match", cached.etag);
+        HttpResponse r = transport_->request(url, "GET", "", {}, headers);
+        if (r.status == 304 && !cached.body.empty()) { r.status = 200; r.body = cached.body; r.headers["etag"] = cached.etag; }
         if (r.transport_error) continue;
         if (r.status < 200 || r.status >= 300) continue;
         J j;
@@ -229,6 +233,10 @@ AgentCard A2AClient::discover(const std::string& endpoint) {
             }
             card.valid = has_v1;
             if (!card.valid && card.parse_error.empty()) card.parse_error = "Agent Card has no supported A2A v1.x interface";
+            if (card.valid) {
+                std::lock_guard lock(discovery_mutex_);
+                card_cache_[url] = {r.body, r.headers.contains("etag") ? r.headers.at("etag") : ""};
+            }
             return card;
         }
     }
@@ -530,10 +538,11 @@ A2AResult A2AClient::rpcCall(const std::string& endpoint, const AuthSpec& auth,
 
 A2AResult A2AClient::sendMessage(const std::string& endpoint, const AuthSpec& auth,
                                  const std::string& message_text,
-                                 const TaskId& task_id, const ContextId& context_id) {
+                                 const TaskId& task_id, const ContextId& context_id,
+                                 const std::string& message_id) {
     J msg;
     msg["role"] = "ROLE_USER";
-    msg["messageId"] = uuid_v4();
+    msg["messageId"] = message_id.empty() ? uuid_v4() : message_id;
     J parts = J::array();
     J p;
     p["text"] = message_text;
