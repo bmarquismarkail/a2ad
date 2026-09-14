@@ -3,24 +3,10 @@
 #include <sqlite3.h>
 #include <nlohmann/json.hpp>
 
-#include <chrono>
-#include <ctime>
 #include <stdexcept>
 
 
 namespace kitty_a2a {
-
-namespace {
-std::string now_iso() {
-    auto now = std::chrono::system_clock::now();
-    std::time_t t = std::chrono::system_clock::to_time_t(now);
-    std::tm tm{};
-    gmtime_r(&t, &tm);
-    char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
-    return buf;
-}
-}  // namespace
 
 struct Database::DbImpl {
     sqlite3* db = nullptr;
@@ -55,6 +41,7 @@ bool Database::open(const std::string& path, std::string* error) {
     );
     CREATE TABLE IF NOT EXISTS tasks (
         id          TEXT PRIMARY KEY,
+        remote_task_id TEXT,
         agent       TEXT NOT NULL,
         context_id  TEXT NOT NULL DEFAULT '',
         state       TEXT NOT NULL,
@@ -66,6 +53,7 @@ bool Database::open(const std::string& path, std::string* error) {
         last_state_change TEXT NOT NULL,
         messages    TEXT NOT NULL DEFAULT '[]',
         artifacts   TEXT NOT NULL DEFAULT '[]',
+        metadata    TEXT NOT NULL DEFAULT '{}',
         error       TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
@@ -81,10 +69,27 @@ bool Database::open(const std::string& path, std::string* error) {
         return false;
     }
 
-    // Bump schema version (idempotent for this milestone).
-    sqlite3_exec(impl_->db,
-        "DELETE FROM schema_version; INSERT INTO schema_version(version) VALUES(1);",
-        nullptr, nullptr, nullptr);
+    // Transactional, idempotent v1 -> v2 migration. Older databases predate
+    // the distinction between a local interaction id and a remote task id.
+    auto has_column = [&](const char* column) {
+        sqlite3_stmt* st = nullptr; bool found = false;
+        if (sqlite3_prepare_v2(impl_->db, "PRAGMA table_info(tasks)", -1, &st, nullptr) == SQLITE_OK) {
+            while (sqlite3_step(st) == SQLITE_ROW) {
+                const char* name = reinterpret_cast<const char*>(sqlite3_column_text(st, 1));
+                if (name && std::string(name) == column) { found = true; break; }
+            }
+        }
+        sqlite3_finalize(st); return found;
+    };
+    if (sqlite3_exec(impl_->db, "BEGIN IMMEDIATE", nullptr, nullptr, &err) != SQLITE_OK ||
+        (!has_column("remote_task_id") && sqlite3_exec(impl_->db, "ALTER TABLE tasks ADD COLUMN remote_task_id TEXT", nullptr, nullptr, &err) != SQLITE_OK) ||
+        (!has_column("metadata") && sqlite3_exec(impl_->db, "ALTER TABLE tasks ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'", nullptr, nullptr, &err) != SQLITE_OK) ||
+        sqlite3_exec(impl_->db, "UPDATE tasks SET remote_task_id=id WHERE remote_task_id IS NULL; DELETE FROM schema_version; INSERT INTO schema_version(version) VALUES(2); COMMIT", nullptr, nullptr, &err) != SQLITE_OK) {
+        std::string msg = err ? err : "unknown"; if (err) sqlite3_free(err);
+        sqlite3_exec(impl_->db, "ROLLBACK", nullptr, nullptr, nullptr);
+        if (error) *error = "schema migration failed: " + msg;
+        close(); return false;
+    }
 
     open_ = true;
     return true;
@@ -156,6 +161,7 @@ std::vector<Agent> Database::loadAgents() {
                     ai.url = it.value("url", "");
                     ai.protocol_binding = it.value("protocolBinding", "jsonrpc");
                     ai.protocol_version = it.value("protocolVersion", "");
+                    ai.tenant = it.value("tenant", "");
                     a.card->interfaces.push_back(std::move(ai));
                 }
             }
@@ -172,15 +178,17 @@ std::vector<Agent> Database::loadAgents() {
 
 static void bindTask(sqlite3_stmt* st, const Task& t) {
     sqlite3_bind_text(st, 1, t.id.value().c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 2, t.agent.value().c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 3, t.context.value().c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 4, to_state_string(t.state).c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 5, t.state_message.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 6, t.title.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 7, t.cwd.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 8, t.created_at.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 9, t.updated_at.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 10, t.last_state_change.c_str(), -1, SQLITE_TRANSIENT);
+    if (t.remote_task_id && !t.remote_task_id->empty()) sqlite3_bind_text(st, 2, t.remote_task_id->value().c_str(), -1, SQLITE_TRANSIENT);
+    else sqlite3_bind_null(st, 2);
+    sqlite3_bind_text(st, 3, t.agent.value().c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, t.context.value().c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, to_state_string(t.state).c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 6, t.state_message.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 7, t.title.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 8, t.cwd.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 9, t.created_at.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 10, t.updated_at.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 11, t.last_state_change.c_str(), -1, SQLITE_TRANSIENT);
     // messages / artifacts serialized
     nlohmann::json msgs = nlohmann::json::array();
     for (const auto& m : t.messages) {
@@ -190,6 +198,8 @@ static void bindTask(sqlite3_stmt* st, const Task& t) {
         mj["contextId"] = m.context_id.value();
         mj["taskId"] = m.task_id.value();
         mj["timestamp"] = m.timestamp;
+        mj["metadata"] = m.metadata;
+        mj["extensions"] = m.extensions;
         nlohmann::json parts = nlohmann::json::array();
         for (const auto& p : m.parts) {
             nlohmann::json pj;
@@ -199,13 +209,14 @@ static void bindTask(sqlite3_stmt* st, const Task& t) {
             if (!p.data.empty()) { try { pj["data"] = nlohmann::json::parse(p.data); } catch (...) { pj["data"] = p.data; } }
             if (!p.media_type.empty()) pj["mediaType"] = p.media_type;
             if (!p.filename.empty()) pj["filename"] = p.filename;
+            if (!p.metadata.empty()) pj["metadata"] = p.metadata;
             parts.push_back(pj);
         }
         mj["parts"] = parts;
         msgs.push_back(mj);
     }
     std::string msgs_s = msgs.dump();
-    sqlite3_bind_text(st, 11, msgs_s.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 12, msgs_s.c_str(), -1, SQLITE_TRANSIENT);
 
     nlohmann::json arts = nlohmann::json::array();
     for (const auto& a : t.artifacts) {
@@ -213,6 +224,8 @@ static void bindTask(sqlite3_stmt* st, const Task& t) {
         aj["artifactId"] = a.artifact_id;
         aj["name"] = a.name;
         aj["description"] = a.description;
+        aj["metadata"] = a.metadata;
+        aj["extensions"] = a.extensions;
         nlohmann::json parts = nlohmann::json::array();
         for (const auto& p : a.parts) {
             nlohmann::json pj;
@@ -222,29 +235,33 @@ static void bindTask(sqlite3_stmt* st, const Task& t) {
             if (!p.data.empty()) { try { pj["data"] = nlohmann::json::parse(p.data); } catch (...) { pj["data"] = p.data; } }
             if (!p.media_type.empty()) pj["mediaType"] = p.media_type;
             if (!p.filename.empty()) pj["filename"] = p.filename;
+            if (!p.metadata.empty()) pj["metadata"] = p.metadata;
             parts.push_back(pj);
         }
         aj["parts"] = parts;
         arts.push_back(aj);
     }
     std::string arts_s = arts.dump();
-    sqlite3_bind_text(st, 12, arts_s.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 13, t.error.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 13, arts_s.c_str(), -1, SQLITE_TRANSIENT);
+    std::string metadata = t.metadata.dump();
+    sqlite3_bind_text(st, 14, metadata.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 15, t.error.c_str(), -1, SQLITE_TRANSIENT);
 }
 
 static Task taskFromRow(sqlite3_stmt* st) {
     Task t;
     t.id = (const char*)sqlite3_column_text(st, 0);
-    t.agent = (const char*)sqlite3_column_text(st, 1);
-    t.context = (const char*)sqlite3_column_text(st, 2);
-    t.state = parse_task_state((const char*)sqlite3_column_text(st, 3)).value_or(TaskState::Submitted);
-    t.state_message = (const char*)sqlite3_column_text(st, 3 + 1);
-    t.title = (const char*)sqlite3_column_text(st, 5);
-    t.cwd = (const char*)sqlite3_column_text(st, 6);
-    t.created_at = (const char*)sqlite3_column_text(st, 7);
-    t.updated_at = (const char*)sqlite3_column_text(st, 8);
-    t.last_state_change = (const char*)sqlite3_column_text(st, 9);
-    t.error = (const char*)sqlite3_column_text(st, 12);
+    if (sqlite3_column_type(st, 1) != SQLITE_NULL) t.remote_task_id = TaskId(reinterpret_cast<const char*>(sqlite3_column_text(st, 1)));
+    t.agent = (const char*)sqlite3_column_text(st, 2);
+    t.context = (const char*)sqlite3_column_text(st, 3);
+    t.state = parse_task_state((const char*)sqlite3_column_text(st, 4)).value_or(TaskState::Unknown);
+    t.state_message = (const char*)sqlite3_column_text(st, 5);
+    t.title = (const char*)sqlite3_column_text(st, 6);
+    t.cwd = (const char*)sqlite3_column_text(st, 7);
+    t.created_at = (const char*)sqlite3_column_text(st, 8);
+    t.updated_at = (const char*)sqlite3_column_text(st, 9);
+    t.last_state_change = (const char*)sqlite3_column_text(st, 10);
+    t.error = (const char*)sqlite3_column_text(st, 14);
 
     auto readParts = [](const nlohmann::json& arr) {
         std::vector<Part> out;
@@ -256,12 +273,13 @@ static Task taskFromRow(sqlite3_stmt* st) {
             if (pj.contains("data")) p.data = pj["data"].is_string() ? pj["data"].get<std::string>() : pj["data"].dump();
             p.media_type = pj.value("mediaType", "");
             p.filename = pj.value("filename", "");
+            if (pj.contains("metadata") && pj["metadata"].is_object()) p.metadata = pj["metadata"];
             out.push_back(p);
         }
         return out;
     };
 
-    const char* msgs = (const char*)sqlite3_column_text(st, 10);
+    const char* msgs = (const char*)sqlite3_column_text(st, 11);
     try {
         auto mj = nlohmann::json::parse(msgs ? msgs : "[]");
         if (mj.is_array()) for (const auto& mm : mj) {
@@ -271,11 +289,14 @@ static Task taskFromRow(sqlite3_stmt* st) {
             m.context_id = mm.value("contextId", "");
             m.task_id = mm.value("taskId", "");
             m.timestamp = mm.value("timestamp", "");
+            if (mm.contains("metadata") && mm["metadata"].is_object()) m.metadata = mm["metadata"];
+            if (mm.contains("extensions") && mm["extensions"].is_array())
+                for (const auto& e : mm["extensions"]) if (e.is_string()) m.extensions.push_back(e.get<std::string>());
             if (mm.contains("parts")) m.parts = readParts(mm["parts"]);
             t.messages.push_back(std::move(m));
         }
     } catch (...) {}
-    const char* arts = (const char*)sqlite3_column_text(st, 11);
+    const char* arts = (const char*)sqlite3_column_text(st, 12);
     try {
         auto aj = nlohmann::json::parse(arts ? arts : "[]");
         if (aj.is_array()) for (const auto& aa : aj) {
@@ -283,10 +304,15 @@ static Task taskFromRow(sqlite3_stmt* st) {
             a.artifact_id = aa.value("artifactId", "");
             a.name = aa.value("name", "");
             a.description = aa.value("description", "");
+            if (aa.contains("metadata") && aa["metadata"].is_object()) a.metadata = aa["metadata"];
+            if (aa.contains("extensions") && aa["extensions"].is_array())
+                for (const auto& e : aa["extensions"]) if (e.is_string()) a.extensions.push_back(e.get<std::string>());
             if (aa.contains("parts")) a.parts = readParts(aa["parts"]);
             t.artifacts.push_back(std::move(a));
         }
     } catch (...) {}
+    const char* metadata = reinterpret_cast<const char*>(sqlite3_column_text(st, 13));
+    try { t.metadata = nlohmann::json::parse(metadata ? metadata : "{}"); } catch (...) {}
     return t;
 }
 
@@ -295,8 +321,8 @@ void Database::insertTask(const Task& task) {
     if (!impl_->db) return;
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(impl_->db,
-        "INSERT OR REPLACE INTO tasks(id,agent,context_id,state,state_message,title,cwd,created_at,updated_at,last_state_change,messages,artifacts,error) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO tasks(id,remote_task_id,agent,context_id,state,state_message,title,cwd,created_at,updated_at,last_state_change,messages,artifacts,metadata,error) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         -1, &st, nullptr) != SQLITE_OK) return;
     bindTask(st, task);
     sqlite3_step(st);
@@ -312,7 +338,7 @@ std::optional<Task> Database::getTask(const std::string& id) {
     if (!impl_->db) return std::nullopt;
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(impl_->db,
-        "SELECT id,agent,context_id,state,state_message,title,cwd,created_at,updated_at,last_state_change,messages,artifacts,error FROM tasks WHERE id=?",
+        "SELECT id,remote_task_id,agent,context_id,state,state_message,title,cwd,created_at,updated_at,last_state_change,messages,artifacts,metadata,error FROM tasks WHERE id=?",
         -1, &st, nullptr) != SQLITE_OK) return std::nullopt;
     sqlite3_bind_text(st, 1, id.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(st) == SQLITE_ROW) {
@@ -328,7 +354,7 @@ std::vector<Task> Database::listTasks(bool include_terminal) {
     std::lock_guard lk(mutex_);
     std::vector<Task> out;
     if (!impl_->db) return out;
-    std::string sql = "SELECT id,agent,context_id,state,state_message,title,cwd,created_at,updated_at,last_state_change,messages,artifacts,error FROM tasks";
+    std::string sql = "SELECT id,remote_task_id,agent,context_id,state,state_message,title,cwd,created_at,updated_at,last_state_change,messages,artifacts,metadata,error FROM tasks";
     if (!include_terminal) sql += " WHERE state NOT IN ('COMPLETED','FAILED','CANCELED','REJECTED')";
     sql += " ORDER BY updated_at DESC";
     sqlite3_stmt* st = nullptr;

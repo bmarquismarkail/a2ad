@@ -7,6 +7,7 @@ using namespace kitty_a2a;
 ADD_TEST(state_roundtrip) {
     struct Case { TaskState s; const char* internal; const char* wire; };
     Case cases[] = {
+        {TaskState::Unknown,       "UNKNOWN",        "TASK_STATE_UNSPECIFIED"},
         {TaskState::Submitted,     "SUBMITTED",      "TASK_STATE_SUBMITTED"},
         {TaskState::Working,       "WORKING",        "TASK_STATE_WORKING"},
         {TaskState::InputRequired, "INPUT_REQUIRED", "TASK_STATE_INPUT_REQUIRED"},

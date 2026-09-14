@@ -29,6 +29,11 @@ struct A2AResult {
     std::vector<Task> tasks;            // ListTasks result
     std::string message_text;          // when the agent replied with a Message (not a Task)
     std::string context_id;
+    std::optional<Message> message;
+    std::string next_page_token;
+    int page_size = 0;
+    int total_size = 0;
+    nlohmann::json value;
 
     // Error classification (empty on success).
     enum class ErrorKind {
@@ -42,8 +47,29 @@ struct A2AResult {
     ErrorKind error_kind = ErrorKind::None;
     std::string error;                 // human-readable detail
     int http_status = 0;               // transport status, if any
+    int protocol_code = 0;
+    nlohmann::json error_details;
 
     bool failed() const { return !ok; }
+};
+
+struct ListTasksFilter {
+    std::string context_id;
+    std::optional<TaskState> status;
+    int page_size = 100;
+    std::string page_token;
+    std::optional<int> history_length;
+    std::string status_timestamp_after;
+    std::optional<bool> include_artifacts;
+};
+
+struct PushNotificationConfig {
+    std::string id;
+    std::string task_id;
+    std::string url;
+    std::string token;
+    std::string auth_scheme;
+    std::string auth_credentials;
 };
 
 // A minimal HTTP transport seam so the protocol logic is unit-testable against
@@ -96,11 +122,20 @@ public:
     // endpoint's origin, then the endpoint itself as a fallback (DESIGN.md §7).
     AgentCard discover(const std::string& endpoint);
 
+    // Register the selected advertised interface. Calls to its URL then carry
+    // the advertised binding, v1 minor version and tenant on every operation.
+    void registerInterface(const AgentInterface& interface);
+
     // Send a message (creates a task or continues an existing one).
     // `task_id`/`context_id` may be empty for a fresh conversation.
     A2AResult sendMessage(const std::string& endpoint, const AuthSpec& auth,
                           const std::string& message_text,
                           const TaskId& task_id, const ContextId& context_id);
+    A2AResult sendStreamingMessage(const std::string& endpoint, const AuthSpec& auth,
+                          const std::string& message_text, const TaskId& task_id,
+                          const ContextId& context_id,
+                          const std::function<void(const nlohmann::json&)>& on_event,
+                          std::stop_token stop = {});
 
     // Poll current task state (GetTask).
     A2AResult getTask(const std::string& endpoint, const AuthSpec& auth, const TaskId& task_id);
@@ -112,6 +147,19 @@ public:
     // persisted registry). Optional context/state filters follow A2A v1.0.
     A2AResult listTasks(const std::string& endpoint, const AuthSpec& auth,
                         const std::string& context_id = {}, int page_size = 100);
+    A2AResult listTasks(const std::string& endpoint, const AuthSpec& auth,
+                        const ListTasksFilter& filter);
+
+    A2AResult createPushConfig(const std::string& endpoint, const AuthSpec& auth,
+                               const PushNotificationConfig& config);
+    A2AResult getPushConfig(const std::string& endpoint, const AuthSpec& auth,
+                            const std::string& task_id, const std::string& id);
+    A2AResult listPushConfigs(const std::string& endpoint, const AuthSpec& auth,
+                             const std::string& task_id, int page_size = 50,
+                             const std::string& page_token = {});
+    A2AResult deletePushConfig(const std::string& endpoint, const AuthSpec& auth,
+                               const std::string& task_id, const std::string& id);
+    A2AResult getExtendedAgentCard(const std::string& endpoint, const AuthSpec& auth);
 
     // Fetch an artifact URL with the same credential policy as A2A calls.
     HttpResponse download(const std::string& url, const AuthSpec& auth);
@@ -130,6 +178,10 @@ private:
     // Perform a JSON-RPC 2.0 call: POSTs to the endpoint, decodes result/error.
     A2AResult rpcCall(const std::string& endpoint, const AuthSpec& auth,
                       const std::string& method, const std::string& params_json);
+    A2AResult streamCall(const std::string& endpoint, const AuthSpec& auth,
+                         const std::string& method, nlohmann::json params,
+                         const std::function<void(const nlohmann::json&)>& on_event,
+                         std::stop_token stop);
 
     // Parse a direct or compatibility-wrapped Task result into our internal Task.
     static std::optional<Task> parseTask(const nlohmann::json& j);
@@ -141,7 +193,8 @@ private:
     std::shared_ptr<CredentialProvider> creds_;
     Options opts_;
     std::mutex bindings_mutex_;
-    std::map<std::string, std::string> bindings_; // interface URL -> normalized binding
+    struct BindingInfo { std::string binding = "JSONRPC"; std::string version = "1.0"; std::string tenant; };
+    std::map<std::string, BindingInfo> bindings_; // interface URL -> selected wire information
 };
 
 }  // namespace kitty_a2a

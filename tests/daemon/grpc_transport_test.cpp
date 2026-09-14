@@ -17,7 +17,7 @@ public:
                          const std::vector<std::pair<std::string, std::string>>&) override {
         return {200, "{\"name\":\"grpc-test\",\"version\":\"1.0\","
                      "\"capabilities\":{\"streaming\":true},\"supportedInterfaces\":[{"
-                     "\"url\":\"127.0.0.1:" + std::to_string(port_) +
+                     "\"url\":\"http://127.0.0.1:" + std::to_string(port_) +
                      "\",\"protocolBinding\":\"GRPC\",\"protocolVersion\":\"1.0\"}]}", false, ""};
     }
 private:
@@ -75,7 +75,7 @@ ADD_TEST(native_grpc_round_trip) {
     A2AClient client(transport, std::shared_ptr<CredentialProvider>(std::move(credentials)));
     auto card = client.discover("http://card.invalid/a2a");
     CHECK(card.valid);
-    const std::string endpoint = "127.0.0.1:" + std::to_string(port);
+    const std::string endpoint = "http://127.0.0.1:" + std::to_string(port);
 
     auto sent = client.sendMessage(endpoint, AuthSpec{}, "hello", TaskId{}, ContextId("grpc-context"));
     CHECK(sent.ok); CHECK(sent.task.has_value());

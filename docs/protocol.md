@@ -77,10 +77,18 @@ returning. →
 
 ```json
 { "op": "remote_list", "agent": "cpp-specialist", "context_id": "c-123",
-  "page_size": 100 }
+  "status": "WORKING", "page_size": 100, "page_token": "...",
+  "history_length": 10, "status_timestamp_after": "2026-08-25T00:00:00Z",
+  "include_artifacts": true }
 ```
 
 Calls the remote agent's A2A `ListTasks`; it does not read the local registry.
+The response also includes `next_page_token`, `page_size`, and `total_size`.
+
+The remaining v1 operations use `stream_submit`, `subscribe`,
+`push.create`, `push.get`, `push.list`, `push.delete`, and
+`agent.extended_card`. Push creation accepts only HTTPS callback URLs and file
+references (`token_file`, `auth_file`) for secrets.
 
 #### `artifact.materialize`
 
@@ -160,13 +168,17 @@ or
 
 ### Methods
 
-| method        | params                                                        | used by    |
-|---------------|---------------------------------------------------------------|------------|
-| `SendMessage` | `message` (role, parts, messageId, taskId?, contextId?)       | `submit`, `respond` |
-| `GetTask`     | `id` (task id)                                                | `status refresh`, `reconcile` |
-| `CancelTask`  | `id`                                                          | `cancel`   |
-| `ListTasks`       | `contextId?`, `pageSize?`                                  | `remote_list` |
-| `SubscribeToTask` | `id` (SSE)                                                 | daemon stream |
+| method | purpose |
+|--------|---------|
+| `SendMessage` | asynchronous ordinary submit/continuation |
+| `SendStreamingMessage` | explicit streaming submit |
+| `GetTask` / `ListTasks` / `CancelTask` | task lifecycle and filtered pagination |
+| `SubscribeToTask` | task update stream |
+| `CreateTaskPushNotificationConfig` | create HTTPS callback configuration |
+| `GetTaskPushNotificationConfig` | retrieve one callback configuration |
+| `ListTaskPushNotificationConfigs` | list callback configurations |
+| `DeleteTaskPushNotificationConfig` | delete one callback configuration |
+| `GetExtendedAgentCard` | retrieve the authenticated card |
 
 #### SendMessage (new task)
 ```json
@@ -176,7 +188,7 @@ or
       "parts": [ { "text": "fix the bug" } ],
       "messageId": "m-<uuid>",
       "contextId": "c-<uuid>"
-  } } }
+  }, "configuration": { "returnImmediately": true } } }
 ```
 
 #### SendMessage (continuation)
@@ -188,7 +200,7 @@ or
       "messageId": "m-<uuid>",
       "taskId": "t-abc",
       "contextId": "c-123"
-  } } }
+  }, "configuration": { "returnImmediately": true } } }
 ```
 
 #### GetTask
@@ -234,8 +246,10 @@ itself a task. A task object:
 ### Agent Card
 
 `GET <endpoint>/.well-known/agent-card.json`. The daemon stores the parsed
-card and uses `supported_interfaces[0].url` as the effective endpoint when
-present. `security_schemes` (non-empty) marks the agent as `requires_auth`.
+card and selects the first supported v1 interface in advertised preference
+order. Its binding, protocol version, and tenant are applied to every request.
+Security schemes and alternative requirements are retained; usable legacy or
+incomplete cards remain available with explicit warnings.
 
 ## 3. Error kinds
 

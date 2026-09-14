@@ -12,8 +12,16 @@ kitten a2a.py list [--all] [--json]
 kitten a2a.py status <task-id> [--json]
 kitten a2a.py agents
 kitten a2a.py submit <agent> [message words...]
+kitten a2a.py stream-submit <agent> [message words...]
+kitten a2a.py remote-list <agent> [filters]
+kitten a2a.py subscribe <task-id>
 kitten a2a.py respond <task-id> [text words...]
 kitten a2a.py cancel <task-id>
+kitten a2a.py push-create <agent> <task-id> <https-url> [--token-file PATH]
+kitten a2a.py push-get <agent> <task-id> <config-id>
+kitten a2a.py push-list <agent> <task-id>
+kitten a2a.py push-delete <agent> <task-id> <config-id>
+kitten a2a.py extended-card <agent>
 ```
 
 It is a thin NDJSON client over the daemon's Unix socket (see
@@ -24,6 +32,10 @@ in the daemon. The kitten only:
 - sends one request, reads one response, formats it for the terminal,
 - colors states (blue=WORKING, yellow=INPUT_REQUIRED, green=COMPLETED,
   red=FAILED, gray=CANCELED).
+
+`remote-list --json` retains the task-array output used by existing scripts;
+`--response-json` prints the pagination envelope. Push tokens and callback
+credentials are accepted only as file references and are redacted from IPC.
 
 ### Installing the kitten
 

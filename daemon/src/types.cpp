@@ -17,6 +17,7 @@ std::string lower(std::string s) {
 
 std::string_view to_string(TaskState state) {
     switch (state) {
+        case TaskState::Unknown:       return "UNKNOWN";
         case TaskState::Submitted:     return "SUBMITTED";
         case TaskState::Working:       return "WORKING";
         case TaskState::InputRequired: return "INPUT_REQUIRED";
@@ -42,12 +43,14 @@ bool is_interrupted(TaskState state) {
 
 // A2A 1.0 wire names are ProtoJSON enum names: "TASK_STATE_" + SCREAMING_SNAKE.
 std::string task_state_wire_name(TaskState state) {
+    if (state == TaskState::Unknown) return "TASK_STATE_UNSPECIFIED";
     return std::string("TASK_STATE_") + std::string(to_string(state));
 }
 
 std::optional<TaskState> parse_task_state(std::string_view s) {
     // Internal (bare) names, case-insensitive.
     std::string v = lower(std::string(s));
+    if (v == "unknown" || v == "unspecified") return TaskState::Unknown;
     if (v == "submitted") return TaskState::Submitted;
     if (v == "working") return TaskState::Working;
     if (v == "input_required" || v == "input-required" || v == "inputrequired")

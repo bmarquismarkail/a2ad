@@ -15,6 +15,22 @@ agents:
     auth:
       type: env                  # env | credential-file | none
       name: CPP_AGENT_TOKEN      # env var to read (type=env) OR file path (type=credential-file)
+      # Optional Agent Card security-scheme mapping. Without this, the two
+      # fields above remain shorthand for Authorization: Bearer <credential>.
+      scheme: bearer             # bearer | basic | apiKey | oauth2 | openIdConnect
+      # in: header               # header | query | cookie (apiKey only)
+      # parameter: X-Api-Key
+      # client_cert: /run/credentials/a2ad/client.crt  # optional mTLS
+      # client_key: /run/credentials/a2ad/client.key
+      # For cards with alternative or conjunctive security requirements, use
+      # references keyed by the card's securitySchemes names instead:
+      # schemes:
+      #   bearer:
+      #     type: credential-file
+      #     name: /run/credentials/a2ad/bearer.token
+      #   client-mtls:
+      #     client_cert: /run/credentials/a2ad/client.crt
+      #     client_key: /run/credentials/a2ad/client.key
   general:
     endpoint: "https://agents.example.internal/a2a"
     host_label: "general"

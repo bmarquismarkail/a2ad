@@ -96,6 +96,20 @@ public:
     std::vector<TaskSummary> listTasks(bool include_terminal = true);
     A2AResult listRemoteTasks(const std::string& agent, const std::string& context_id = {},
                               int page_size = 100);
+    A2AResult listRemoteTasks(const std::string& agent, const ListTasksFilter& filter);
+    A2AResult streamMessage(const std::string& agent, const std::string& message,
+                            const TaskId& task_id, const ContextId& context_id,
+                            const std::function<void(const nlohmann::json&)>& on_event,
+                            std::stop_token stop = {});
+    A2AResult subscribeTask(const std::string& local_task_id,
+                            const std::function<void(const Task&)>& on_task,
+                            std::stop_token stop = {});
+    A2AResult createPushConfig(const std::string& agent, const PushNotificationConfig& config);
+    A2AResult getPushConfig(const std::string& agent, const std::string& task_id, const std::string& id);
+    A2AResult listPushConfigs(const std::string& agent, const std::string& task_id,
+                              int page_size, const std::string& page_token);
+    A2AResult deletePushConfig(const std::string& agent, const std::string& task_id, const std::string& id);
+    A2AResult getExtendedAgentCard(const std::string& agent);
     std::optional<Task> getTask(const std::string& id);
     std::vector<Agent> listAgents();
     std::vector<std::string> listAgentIds() const;

@@ -80,15 +80,21 @@ def _rpc(path: str, payload: dict, timeout: float = 10.0) -> dict:
             ) from e
         sock.sendall((json.dumps(payload) + "\n").encode())
         buf = b""
-        while b"\n" not in buf:
+        while True:
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                line = line.decode().strip()
+                if not line:
+                    continue
+                response = json.loads(line)
+                # State events may race the response on long-running calls.
+                # They are asynchronous broadcasts, not this RPC's reply.
+                if isinstance(response, dict) and "ok" in response:
+                    return response
             chunk = sock.recv(65536)
             if not chunk:
                 raise A2AError(f"daemon closed the connection (request: {payload.get('op')})")
             buf += chunk
-        line = buf.split(b"\n", 1)[0].decode().strip()
-        if not line:
-            raise A2AError("daemon returned an empty response")
-        return json.loads(line)
     finally:
         sock.close()
 
@@ -184,7 +190,14 @@ def main(args: list[str]) -> int:
     p_remote = sub.add_parser("remote-list", help="list tasks directly from an agent")
     p_remote.add_argument("agent")
     p_remote.add_argument("--context-id", default="")
+    p_remote.add_argument("--status", default="")
+    p_remote.add_argument("--page-size", type=int, default=100)
+    p_remote.add_argument("--page-token", default="")
+    p_remote.add_argument("--history-length", type=int)
+    p_remote.add_argument("--status-timestamp-after", default="")
+    p_remote.add_argument("--include-artifacts", action=argparse.BooleanOptionalAction, default=None)
     p_remote.add_argument("--json", action="store_true")
+    p_remote.add_argument("--response-json", action="store_true", help="print pagination envelope as JSON")
 
     p_status = sub.add_parser("status", help="task detail")
     p_status.add_argument("task_id")
@@ -197,6 +210,31 @@ def main(args: list[str]) -> int:
     p_submit.add_argument("message", nargs="*", help="prompt text (words joined by spaces)")
     p_submit.add_argument("--route", action="store_true",
                           help="route by cwd; the positional agent becomes the first message word")
+
+    p_stream = sub.add_parser("stream-submit", help="use SendStreamingMessage explicitly")
+    p_stream.add_argument("agent")
+    p_stream.add_argument("message", nargs="+")
+    p_stream.add_argument("--task-id", default="")
+    p_stream.add_argument("--context-id", default="")
+    p_stream.add_argument("--json", action="store_true")
+
+    p_subscribe = sub.add_parser("subscribe", help="subscribe to a persisted remote task")
+    p_subscribe.add_argument("task_id")
+    p_subscribe.add_argument("--json", action="store_true")
+
+    p_push_create = sub.add_parser("push-create", help="create a task push notification config")
+    p_push_create.add_argument("agent"); p_push_create.add_argument("task_id"); p_push_create.add_argument("url")
+    p_push_create.add_argument("--id", default=""); p_push_create.add_argument("--token-file", default="")
+    p_push_create.add_argument("--auth-scheme", default=""); p_push_create.add_argument("--auth-file", default="")
+    p_push_get = sub.add_parser("push-get", help="get a task push notification config")
+    p_push_get.add_argument("agent"); p_push_get.add_argument("task_id"); p_push_get.add_argument("id")
+    p_push_list = sub.add_parser("push-list", help="list task push notification configs")
+    p_push_list.add_argument("agent"); p_push_list.add_argument("task_id")
+    p_push_list.add_argument("--page-size", type=int, default=50); p_push_list.add_argument("--page-token", default="")
+    p_push_delete = sub.add_parser("push-delete", help="delete a task push notification config")
+    p_push_delete.add_argument("agent"); p_push_delete.add_argument("task_id"); p_push_delete.add_argument("id")
+    p_extended = sub.add_parser("extended-card", help="fetch an authenticated extended Agent Card")
+    p_extended.add_argument("agent")
 
     p_respond = sub.add_parser("respond", help="answer an input-required task")
     p_respond.add_argument("task_id")
@@ -248,11 +286,18 @@ def main(args: list[str]) -> int:
             return 0
 
         if ns.cmd == "remote-list":
-            r = _rpc(path, {"op": "remote_list", "agent": ns.agent,
-                            "context_id": ns.context_id}, timeout=35.0)
+            request = {"op": "remote_list", "agent": ns.agent, "context_id": ns.context_id,
+                       "page_size": ns.page_size, "page_token": ns.page_token,
+                       "status_timestamp_after": ns.status_timestamp_after}
+            if ns.status: request["status"] = ns.status
+            if ns.history_length is not None: request["history_length"] = ns.history_length
+            if ns.include_artifacts is not None: request["include_artifacts"] = ns.include_artifacts
+            r = _rpc(path, request, timeout=35.0)
             if not r.get("ok"):
                 _die(f"error: {r.get('error', 'unknown')}")
-            if ns.json:
+            if ns.response_json:
+                print(json.dumps(r, indent=2))
+            elif ns.json:
                 print(json.dumps(r["tasks"], indent=2))
             else:
                 tasks = r["tasks"]
@@ -278,6 +323,42 @@ def main(args: list[str]) -> int:
                 print(f"  {name:<20} {avail:<11} {endpoint}")
                 if desc:
                     print(f"    {desc}")
+                for warning in a.get("warnings", []):
+                    print(f"    warning: {warning}")
+            return 0
+
+        if ns.cmd == "stream-submit":
+            r = _rpc(path, {"op": "stream_submit", "agent": ns.agent,
+                            "message": " ".join(ns.message), "task_id": ns.task_id,
+                            "context_id": ns.context_id}, timeout=3600.0)
+            if not r.get("ok"): _die(f"error: {r.get('error', 'unknown')}")
+            if ns.json: print(json.dumps(r["events"], indent=2))
+            else:
+                for event in r["events"]: print(json.dumps(event, ensure_ascii=False))
+            return 0
+
+        if ns.cmd == "subscribe":
+            r = _rpc(path, {"op": "subscribe", "task_id": ns.task_id}, timeout=3600.0)
+            if not r.get("ok"): _die(f"error: {r.get('error', 'unknown')}")
+            if ns.json: print(json.dumps(r["updates"], indent=2))
+            else:
+                for update in r["updates"]: print(_task_line(update))
+            return 0
+
+        if ns.cmd.startswith("push-"):
+            op = "push." + ns.cmd.removeprefix("push-")
+            request = {"op": op, "agent": ns.agent, "task_id": ns.task_id}
+            for key in ("id", "url", "token_file", "auth_scheme", "auth_file", "page_size", "page_token"):
+                if hasattr(ns, key): request[key] = getattr(ns, key)
+            r = _rpc(path, request, timeout=35.0)
+            if not r.get("ok"): _die(f"error: {r.get('error', 'unknown')}")
+            print(json.dumps(r.get("config", r.get("result", {})), indent=2))
+            return 0
+
+        if ns.cmd == "extended-card":
+            r = _rpc(path, {"op": "agent.extended_card", "agent": ns.agent}, timeout=35.0)
+            if not r.get("ok"): _die(f"error: {r.get('error', 'unknown')}")
+            print(json.dumps(r["card"], indent=2))
             return 0
 
         if ns.cmd == "submit":

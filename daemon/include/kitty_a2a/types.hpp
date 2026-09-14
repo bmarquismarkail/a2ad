@@ -20,6 +20,7 @@ namespace kitty_a2a {
 // (non-terminal) states; a task returns to WORKING after the client responds.
 // COMPLETED / FAILED / CANCELED / REJECTED are terminal.
 enum class TaskState {
+    Unknown,
     Submitted,
     Working,
     InputRequired,

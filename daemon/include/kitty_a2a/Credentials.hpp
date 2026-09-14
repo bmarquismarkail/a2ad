@@ -3,6 +3,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace kitty_a2a {
 
@@ -14,6 +15,13 @@ struct AuthSpec {
     // For HTTP header auth (api-key, basic, bearer): set header_name + header_value.
     std::string header_name;   // e.g. "Authorization", "X-Api-Key"
     std::string header_value;  // e.g. "Bearer <token>", "<key>"
+    std::vector<std::pair<std::string, std::string>> extra_headers;
+    std::string query_name;
+    std::string query_value;
+    std::vector<std::pair<std::string, std::string>> extra_query;
+    std::string cookie_value;
+    std::string client_cert_file;
+    std::string client_key_file;
 
     // The kind of auth, for logging/diagnostics (never the secret itself).
     std::string scheme;        // "env" | "credential-file" | "none" | "error"

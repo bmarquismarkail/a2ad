@@ -46,6 +46,12 @@ agents:
     auth:
       type: env
       name: CPP_AGENT_TOKEN
+      schemes:
+        api-key:
+          type: credential-file
+          name: /run/credentials/api-key
+          in: header
+          parameter: X-Api-Key
   general:
     endpoint: https://general.local/a2a
 projects:
@@ -63,6 +69,10 @@ projects:
         CHECK_EQ(a.host_label, std::string("dev01"));
         CHECK_EQ(a.auth_type, std::string("env"));
         CHECK_EQ(a.auth_name, std::string("CPP_AGENT_TOKEN"));
+        CHECK_EQ(a.auth_schemes.size(), size_t{1});
+        if (a.auth_schemes.contains("api-key")) {
+            CHECK_EQ(a.auth_schemes.at("api-key").parameter, std::string("X-Api-Key"));
+        }
     }
     CHECK_EQ(c.projects.size(), (size_t)1);
     fs::remove(p);

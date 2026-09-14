@@ -2,6 +2,9 @@
 
 #include <string>
 #include <vector>
+#include <optional>
+
+#include <nlohmann/json.hpp>
 
 #include "kitty_a2a/Artifact.hpp"
 #include "kitty_a2a/types.hpp"
@@ -17,6 +20,9 @@ struct Message {
     ContextId context_id;
     std::vector<std::string> reference_task_ids;
     std::string timestamp;         // ISO-8601 UTC, if the server supplied one
+    nlohmann::json metadata = nlohmann::json::object();
+
+    std::vector<std::string> extensions;
 
     // The concatenated text of this message's text/data parts — what a human
     // wants to see in a task view.
@@ -32,6 +38,8 @@ struct Message {
 // instance is shared across threads by pointer without that lock.
 struct Task {
     TaskId id;
+    // Empty for a direct Message response. Local `id` remains the durable IPC id.
+    std::optional<TaskId> remote_task_id;
     AgentId agent;
     ContextId context;
 
@@ -47,6 +55,12 @@ struct Task {
 
     std::vector<Message> messages; // conversation history
     std::vector<Artifact> artifacts;
+    nlohmann::json metadata = nlohmann::json::object();
+
+    // Transient stream-merge hints; these are not persisted on their own.
+    bool partial_update = false;
+    bool has_state_update = true;
+    bool artifact_append = false;
 
     // Most recent error detail, when state == Failed or the last update failed.
     std::string error;

@@ -68,7 +68,9 @@ HttpResponse CurlTransport::request(const std::string& endpoint, const std::stri
     std::string resp_body;
     curl_slist* hdrs = nullptr;
     for (const auto& [k, v] : headers) {
-        hdrs = curl_slist_append(hdrs, (k + ": " + v).c_str());
+        if (k == "X-A2AD-Client-Cert-File") curl_easy_setopt(curl, CURLOPT_SSLCERT, v.c_str());
+        else if (k == "X-A2AD-Client-Key-File") curl_easy_setopt(curl, CURLOPT_SSLKEY, v.c_str());
+        else hdrs = curl_slist_append(hdrs, (k + ": " + v).c_str());
     }
     // Ensure Accept is present for GETs (agent card discovery).
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
@@ -89,6 +91,12 @@ HttpResponse CurlTransport::request(const std::string& endpoint, const std::stri
 
     if (method == "GET") {
         curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+    } else if (method == "DELETE") {
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+        if (!body.empty()) {
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
+        }
     } else {  // POST (default for A2A JSON-RPC)
         curl_easy_setopt(curl, CURLOPT_POST, 1L);
         if (!body.empty()) {
@@ -124,7 +132,11 @@ HttpResponse CurlTransport::stream(const std::string& endpoint, const std::strin
     CURL* curl = curl_easy_init();
     if (!curl) { r.transport_error = true; r.transport_error_detail = "curl_easy_init failed"; return r; }
     curl_slist* hdrs = nullptr;
-    for (const auto& [key, value] : headers) hdrs = curl_slist_append(hdrs, (key + ": " + value).c_str());
+    for (const auto& [key, value] : headers) {
+        if (key == "X-A2AD-Client-Cert-File") curl_easy_setopt(curl, CURLOPT_SSLCERT, value.c_str());
+        else if (key == "X-A2AD-Client-Key-File") curl_easy_setopt(curl, CURLOPT_SSLKEY, value.c_str());
+        else hdrs = curl_slist_append(hdrs, (key + ": " + value).c_str());
+    }
     StreamContext context{&on_chunk};
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, streamCb);

@@ -34,6 +34,9 @@ ADD_TEST(send_message_request_shape) {
     // message.parts[0].text should carry the payload.
     CHECK(j.contains("params"));
     CHECK(j["params"]["message"].contains("parts"));
+    CHECK(j["params"]["configuration"]["returnImmediately"].get<bool>());
+    const auto message_id = j["params"]["message"]["messageId"].get<std::string>();
+    CHECK_EQ(message_id.size(), size_t{36});
 }
 
 ADD_TEST(cancel_task_request_shape) {

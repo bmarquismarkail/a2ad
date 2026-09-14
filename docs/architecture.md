@@ -95,11 +95,10 @@ daemon is tolerant of mixed-version fleets.
 | `agent/getTasks`            | `GetTask` (singular) / `ListTasks`|
 | `agent/sendMessage`         | `SendMessage`                     |
 | `agent/cancelTask`          | `CancelTask`                      |
-| `agent/subscribeToTask`     | `SubscribeToTask` (SSE, unimpl.)  |
+| `agent/subscribeToTask`     | `SubscribeToTask` (SSE/gRPC)      |
 
-The A2A v1.0 JSON-RPC methods use CamelCase. The daemon sends `GetTask`,
-`SendMessage`, `CancelTask`. (`ListTasks` is parsed but not yet wired to an
-IPC op in v0.)
+The A2A v1.0 JSON-RPC methods use CamelCase. The daemon implements the complete
+eleven-operation v1 client surface across every standard binding.
 
 ### Request/response envelope
 
@@ -123,9 +122,10 @@ The daemon's `A2AClient::parseResponse` handles both the `result` and the
 
 Path unchanged: `/.well-known/agent-card.json`. v1.0 added
 `supported_interfaces` (a list of `{url, protocol_binding, protocol_version}`)
-and `security_schemes` (OpenAPI-style). The daemon reads
-`supported_interfaces[0].url` as the effective endpoint when present, and
-treats a non-empty `security_schemes` map as `requires_auth() == true`.
+and `security_schemes` (OpenAPI-style). The daemon selects the first supported
+v1 interface, carries its binding/version/tenant on every call, and parses both
+security schemes and alternative security requirements. Missing required card
+fields produce compatibility warnings when the card remains usable.
 
 ## IPC protocol (v0)
 

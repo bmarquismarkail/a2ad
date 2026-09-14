@@ -27,7 +27,19 @@ public:
         last_method = method;
         last_body = body;
         last_headers = headers;
-        if (!queue.empty()) { auto r = queue.front(); queue.erase(queue.begin()); return r; }
+        if (!queue.empty()) {
+            auto r = queue.front(); queue.erase(queue.begin());
+            // Most fixtures use id "1" as a placeholder. Reflect the actual
+            // request id so tests remain strict without depending on suite order.
+            try {
+                auto response = nlohmann::json::parse(r.body);
+                auto request = nlohmann::json::parse(body);
+                if (response.value("id", "") == "1" && request.contains("id")) {
+                    response["id"] = request["id"]; r.body = response.dump();
+                }
+            } catch (...) {}
+            return r;
+        }
         return fallback;
     }
 };
@@ -172,6 +184,25 @@ ADD_TEST(subscribe_parses_sse_task_update) {
     if (update) CHECK_EQ(update->state, TaskState::InputRequired);
 }
 
+ADD_TEST(subscribe_preserves_status_and_artifact_deltas) {
+    auto mt = std::make_shared<MockTransport>(); auto creds = make_credential_provider();
+    A2AClient client(mt, std::shared_ptr<CredentialProvider>(std::move(creds)));
+    mt->queue.push_back({200,
+        "data: {\"result\":{\"statusUpdate\":{\"taskId\":\"streamed\",\"contextId\":\"ctx\",\"status\":{\"state\":\"TASK_STATE_WORKING\"}}}}\n\n"
+        "data: {\"result\":{\"artifactUpdate\":{\"taskId\":\"streamed\",\"artifact\":{\"artifactId\":\"a1\",\"parts\":[{\"text\":\"chunk\"}]},\"append\":true}}}\n\n",
+        false, ""});
+    std::vector<Task> updates;
+    auto result = client.subscribeToTask("http://agent/a2a", AuthSpec{}, TaskId("streamed"),
+                                         [&](const Task& task) { updates.push_back(task); });
+    CHECK(result.ok); CHECK_EQ(updates.size(), size_t{2});
+    if (updates.size() == 2) {
+        CHECK(updates[0].partial_update); CHECK(updates[0].has_state_update);
+        CHECK_EQ(updates[0].state, TaskState::Working);
+        CHECK(updates[1].partial_update); CHECK(!updates[1].has_state_update);
+        CHECK(updates[1].artifact_append); CHECK_EQ(updates[1].artifacts.size(), size_t{1});
+    }
+}
+
 ADD_TEST(parse_direct_message_result) {
     auto mt = std::make_shared<MockTransport>();
     auto creds = make_credential_provider();
@@ -289,4 +320,82 @@ ADD_TEST(discover_agent_card) {
     }
     CHECK(card.auth_schemes.size() >= 1);
     CHECK(card.requires_auth());
+}
+
+ADD_TEST(v1_interface_carries_tenant_version_and_rest_filters) {
+    auto mt = std::make_shared<MockTransport>();
+    auto creds = make_credential_provider();
+    A2AClient client(mt, std::shared_ptr<CredentialProvider>(std::move(creds)));
+    client.registerInterface({"https://agent.example/a2a", "HTTP+JSON", "1.0.1", "tenant a"});
+    mt->queue.push_back({200, R"({"tasks":[],"nextPageToken":"next","pageSize":7,"totalSize":19})", false, ""});
+    ListTasksFilter filter; filter.context_id = "ctx/one"; filter.status = TaskState::Working;
+    filter.page_size = 7; filter.page_token = "p+1"; filter.history_length = 3;
+    filter.status_timestamp_after = "2026-08-25T00:00:00Z"; filter.include_artifacts = true;
+    auto result = client.listTasks("https://agent.example/a2a", AuthSpec{}, filter);
+    CHECK(result.ok);
+    CHECK_EQ(result.next_page_token, std::string("next"));
+    CHECK_EQ(result.page_size, 7);
+    CHECK_EQ(result.total_size, 19);
+    CHECK_EQ(mt->last_method, std::string("GET"));
+    CHECK(mt->last_url.find("tenant%20a/tasks?") != std::string::npos);
+    CHECK(mt->last_url.find("contextId=ctx%2Fone") != std::string::npos);
+    CHECK(mt->last_url.find("pageToken=p%2B1") != std::string::npos);
+    bool version = false;
+    for (const auto& [key, value] : mt->last_headers) if (key == "A2A-Version" && value == "1.0.1") version = true;
+    CHECK(version);
+}
+
+ADD_TEST(failed_task_is_valid_protocol_result) {
+    auto mt = std::make_shared<MockTransport>(); auto creds = make_credential_provider();
+    A2AClient client(mt, std::shared_ptr<CredentialProvider>(std::move(creds)));
+    mt->queue.push_back({200, R"({"jsonrpc":"2.0","id":"1","result":{"id":"failed","status":{"state":"TASK_STATE_FAILED"}}})", false, ""});
+    auto result = client.getTask("http://x", AuthSpec{}, TaskId("failed"));
+    CHECK(result.ok); CHECK(result.task.has_value());
+    CHECK_EQ(result.error_kind, A2AResult::ErrorKind::TaskFailure);
+}
+
+ADD_TEST(jsonrpc_response_id_must_match) {
+    auto mt = std::make_shared<MockTransport>(); auto creds = make_credential_provider();
+    A2AClient client(mt, std::shared_ptr<CredentialProvider>(std::move(creds)));
+    mt->queue.push_back({200, R"({"jsonrpc":"2.0","id":"wrong","result":{"id":"t","status":{"state":"TASK_STATE_WORKING"}}})", false, ""});
+    auto result = client.getTask("http://x", AuthSpec{}, TaskId("t"));
+    CHECK(!result.ok); CHECK_EQ(result.error_kind, A2AResult::ErrorKind::MalformedResponse);
+}
+
+ADD_TEST(rest_push_delete_uses_delete) {
+    auto mt = std::make_shared<MockTransport>(); auto creds = make_credential_provider();
+    A2AClient client(mt, std::shared_ptr<CredentialProvider>(std::move(creds)));
+    client.registerInterface({"https://agent.example/a2a", "HTTP+JSON", "1.0", ""});
+    mt->queue.push_back({204, "", false, ""});
+    auto result = client.deletePushConfig("https://agent.example/a2a", AuthSpec{}, "task/1", "cfg 1");
+    CHECK(result.ok); CHECK_EQ(mt->last_method, std::string("DELETE"));
+    CHECK(mt->last_url.find("tasks/task%2F1/pushNotificationConfigs/cfg%201") != std::string::npos);
+}
+
+ADD_TEST(nonconforming_card_remains_available_with_warning) {
+    auto mt = std::make_shared<MockTransport>(); auto creds = make_credential_provider();
+    A2AClient client(mt, std::shared_ptr<CredentialProvider>(std::move(creds)));
+    mt->fallback = {200, R"({"name":"compat","version":"1.0","capabilities":{},"supportedInterfaces":[{"url":"http://127.0.0.1:9900/","protocolBinding":"JSONRPC","protocolVersion":"1.0","tenant":"home"}]})", false, ""};
+    auto card = client.discover("http://127.0.0.1:9900");
+    CHECK(card.valid); CHECK(!card.warnings.empty()); CHECK_EQ(card.interfaces[0].tenant, std::string("home"));
+}
+
+ADD_TEST(required_unknown_extension_prevents_selection) {
+    auto mt = std::make_shared<MockTransport>(); auto creds = make_credential_provider();
+    A2AClient client(mt, std::shared_ptr<CredentialProvider>(std::move(creds)));
+    mt->fallback = {200, R"({"name":"extended","description":"x","version":"1.0","defaultInputModes":["text/plain"],"defaultOutputModes":["text/plain"],"skills":[{"id":"s","name":"s","description":"s","tags":[]}],"capabilities":{"extensions":[{"uri":"urn:required:unknown","required":true}]},"supportedInterfaces":[{"url":"https://agent/a2a","protocolBinding":"JSONRPC","protocolVersion":"1.0"}]})", false, ""};
+    auto card = client.discover("https://agent/a2a");
+    CHECK(!card.valid); CHECK(card.parse_error.find("urn:required:unknown") != std::string::npos);
+}
+
+ADD_TEST(part_preserves_scalar_data_and_artifact_extensions) {
+    auto mt = std::make_shared<MockTransport>(); auto creds = make_credential_provider();
+    A2AClient client(mt, std::shared_ptr<CredentialProvider>(std::move(creds)));
+    mt->queue.push_back({200, R"({"jsonrpc":"2.0","id":"1","result":{"id":"t","status":{"state":"TASK_STATE_COMPLETED"},"artifacts":[{"artifactId":"a","extensions":["urn:x"],"parts":[{"data":[1,true]}]}]}})", false, ""});
+    auto result = client.getTask("http://x", AuthSpec{}, TaskId("t"));
+    CHECK(result.ok); CHECK(result.task.has_value());
+    if (result.task) {
+        CHECK_EQ(result.task->artifacts[0].extensions.size(), size_t{1});
+        CHECK_EQ(result.task->artifacts[0].parts[0].data, std::string("[1,true]"));
+    }
 }

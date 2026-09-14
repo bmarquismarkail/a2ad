@@ -122,6 +122,24 @@ Config load_config(const std::string& path, bool require, std::string* error) {
                     const auto& a = kv.second["auth"];
                     if (a["type"]) ac.auth_type = a["type"].as<std::string>();
                     if (a["name"]) ac.auth_name = a["name"].as<std::string>();
+                    if (a["scheme"]) ac.auth_scheme = a["scheme"].as<std::string>();
+                    if (a["in"]) ac.auth_location = a["in"].as<std::string>();
+                    if (a["parameter"]) ac.auth_parameter = a["parameter"].as<std::string>();
+                    if (a["client_cert"]) ac.auth_client_cert = a["client_cert"].as<std::string>();
+                    if (a["client_key"]) ac.auth_client_key = a["client_key"].as<std::string>();
+                    if (a["schemes"] && a["schemes"].IsMap()) {
+                        for (const auto& entry : a["schemes"]) {
+                            AuthReference ref; const auto& value = entry.second;
+                            if (value["type"]) ref.type = value["type"].as<std::string>();
+                            if (value["name"]) ref.name = value["name"].as<std::string>();
+                            if (value["scheme"]) ref.scheme = value["scheme"].as<std::string>();
+                            if (value["in"]) ref.location = value["in"].as<std::string>();
+                            if (value["parameter"]) ref.parameter = value["parameter"].as<std::string>();
+                            if (value["client_cert"]) ref.client_cert = value["client_cert"].as<std::string>();
+                            if (value["client_key"]) ref.client_key = value["client_key"].as<std::string>();
+                            ac.auth_schemes[entry.first.as<std::string>()] = std::move(ref);
+                        }
+                    }
                 }
                 cfg.agents[kv.first.as<std::string>()] = ac;
             }

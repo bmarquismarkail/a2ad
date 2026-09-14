@@ -15,8 +15,9 @@ upstream rather than assumed from `DESIGN.md`:
 - **Enum spelling**: v1.0 uses `SCREAMING_SNAKE_CASE` (e.g.
   `TASK_STATE_INPUT_REQUIRED`), not the v0.3 `input-required` kebab-case the
   design doc shows.
-- **Operations**: `SendMessage`, `GetTask`, `ListTasks`, `CancelTask`,
-  `SubscribeToTask`; Agent Card at `/.well-known/agent-card.json`.
+- **Operations**: all eleven v1 operations, including explicit streaming send,
+  push-notification configuration CRUD, and the extended Agent Card; public
+  Agent Card at `/.well-known/agent-card.json`.
 - **Kitty 0.48.2**: custom kitten `main(args)` with optional
   `handle_result(...)`; `no_ui=True` supported; `kitty @` remote-control
   commands (`get-text`, `set-tab-title`) and keyboard-mode mapping
@@ -142,3 +143,15 @@ Implementation order, each unit compile-checked in isolation before the next:
 - Unit tests: **196 assertions, 0 failures**, including an idle-CPU regression
   check for the IPC listener.
 - Full CTest: **3/3 suites passed** (`unit`, IPC end-to-end, daemon mode).
+
+## Milestone 10 — A2A v1.0 full client conformance (done)
+
+- Selected interfaces carry binding, v1 minor version, and optional tenant.
+- All eleven operations are available over JSON-RPC, HTTP+JSON, and gRPC.
+- Ordinary sends request immediate return; streaming send remains explicit.
+- Errors, pagination, filters, version headers, UUIDs, metadata, unknown states,
+  TLS-by-default gRPC, and direct Message responses follow v1 semantics.
+- Card security requirements are parsed; legacy bearer configuration remains
+  shorthand while API keys, HTTP auth, OAuth/OIDC, and mTLS are supported.
+- SQLite schema v2 migration separates local interaction and remote task IDs.
+- Usable nonconforming cards remain available with compatibility warnings.

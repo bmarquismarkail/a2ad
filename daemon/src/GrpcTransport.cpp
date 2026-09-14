@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cctype>
 #include <memory>
+#include <fstream>
+#include <sstream>
 
 #include <grpcpp/grpcpp.h>
 #include <google/protobuf/util/json_util.h>
@@ -21,22 +23,38 @@ std::string targetFor(std::string endpoint) {
     return endpoint;
 }
 
-std::shared_ptr<grpc::Channel> channelFor(const std::string& endpoint) {
-    const bool secure = endpoint.rfind("https://", 0) == 0;
-    std::shared_ptr<grpc::ChannelCredentials> credentials = secure
-        ? grpc::SslCredentials(grpc::SslCredentialsOptions{})
-        : grpc::InsecureChannelCredentials();
+std::string readFile(const std::string& path) {
+    std::ifstream input(path, std::ios::binary); std::ostringstream out; out << input.rdbuf(); return out.str();
+}
+
+std::shared_ptr<grpc::Channel> channelFor(const std::string& endpoint, const AuthSpec& auth) {
+    // Canonical gRPC targets (host:port) are TLS by default. Only an explicit
+    // http:// scheme opts into plaintext, which is suitable for local tunnels.
+    const bool secure = endpoint.rfind("http://", 0) != 0;
+    grpc::SslCredentialsOptions options;
+    if (!auth.client_cert_file.empty()) options.pem_cert_chain = readFile(auth.client_cert_file);
+    if (!auth.client_key_file.empty()) options.pem_private_key = readFile(auth.client_key_file);
+    std::shared_ptr<grpc::ChannelCredentials> credentials = secure ? grpc::SslCredentials(options)
+                                                                  : grpc::InsecureChannelCredentials();
     return grpc::CreateChannel(targetFor(endpoint), std::move(credentials));
 }
 
-void configureContext(grpc::ClientContext& context, const AuthSpec& auth, bool streaming) {
+void configureContext(grpc::ClientContext& context, const AuthSpec& auth, bool streaming,
+                      std::string_view version = "1.0") {
     if (auth.active && !auth.header_value.empty()) {
         std::string key = auth.header_name;
         std::transform(key.begin(), key.end(), key.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         context.AddMetadata(key, auth.header_value);
     }
-    context.AddMetadata("a2a-version", "1.0");
+    for (const auto& [header, value] : auth.extra_headers) {
+        std::string key = header;
+        std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        context.AddMetadata(key, value);
+    }
+    if (auth.active && !auth.query_name.empty()) context.AddMetadata(auth.query_name, auth.query_value);
+    for (const auto& [name, value] : auth.extra_query) context.AddMetadata(name, value);
+    context.AddMetadata("a2a-version", std::string(version));
     if (!streaming) context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(30));
 }
 
@@ -82,10 +100,11 @@ void setJson(const Message& message, HttpResponse* response) {
 }  // namespace
 
 HttpResponse grpcCall(const std::string& endpoint, const AuthSpec& auth,
-                      const std::string& method, const nlohmann::json& params) {
-    auto stub = pb::A2AService::NewStub(channelFor(endpoint));
+                      const std::string& method, const nlohmann::json& params,
+                      const std::string& protocol_version) {
+    auto stub = pb::A2AService::NewStub(channelFor(endpoint, auth));
     grpc::ClientContext context;
-    configureContext(context, auth, false);
+    configureContext(context, auth, false, protocol_version);
     HttpResponse response;
     grpc::Status status;
 
@@ -109,6 +128,31 @@ HttpResponse grpcCall(const std::string& endpoint, const AuthSpec& auth,
         if (!fromJson(params, &request, &response)) return response;
         status = stub->CancelTask(&context, request, &result);
         response = fromStatus(status); if (status.ok()) setJson(result, &response);
+    } else if (method == "CreateTaskPushNotificationConfig") {
+        pb::TaskPushNotificationConfig request, result;
+        if (!fromJson(params, &request, &response)) return response;
+        status = stub->CreateTaskPushNotificationConfig(&context, request, &result);
+        response = fromStatus(status); if (status.ok()) setJson(result, &response);
+    } else if (method == "GetTaskPushNotificationConfig") {
+        pb::GetTaskPushNotificationConfigRequest request; pb::TaskPushNotificationConfig result;
+        if (!fromJson(params, &request, &response)) return response;
+        status = stub->GetTaskPushNotificationConfig(&context, request, &result);
+        response = fromStatus(status); if (status.ok()) setJson(result, &response);
+    } else if (method == "ListTaskPushNotificationConfigs") {
+        pb::ListTaskPushNotificationConfigsRequest request; pb::ListTaskPushNotificationConfigsResponse result;
+        if (!fromJson(params, &request, &response)) return response;
+        status = stub->ListTaskPushNotificationConfigs(&context, request, &result);
+        response = fromStatus(status); if (status.ok()) setJson(result, &response);
+    } else if (method == "DeleteTaskPushNotificationConfig") {
+        pb::DeleteTaskPushNotificationConfigRequest request; google::protobuf::Empty result;
+        if (!fromJson(params, &request, &response)) return response;
+        status = stub->DeleteTaskPushNotificationConfig(&context, request, &result);
+        response = fromStatus(status); if (status.ok()) setJson(result, &response);
+    } else if (method == "GetExtendedAgentCard") {
+        pb::GetExtendedAgentCardRequest request; pb::AgentCard result;
+        if (!fromJson(params, &request, &response)) return response;
+        status = stub->GetExtendedAgentCard(&context, request, &result);
+        response = fromStatus(status); if (status.ok()) setJson(result, &response);
     } else {
         response.status = 400;
         response.body = "unsupported gRPC operation: " + method;
@@ -116,24 +160,39 @@ HttpResponse grpcCall(const std::string& endpoint, const AuthSpec& auth,
     return response;
 }
 
-HttpResponse grpcSubscribe(const std::string& endpoint, const AuthSpec& auth,
-                           const std::string& task_id,
-                           const std::function<bool(const nlohmann::json&)>& on_event,
-                           std::stop_token stop) {
-    auto stub = pb::A2AService::NewStub(channelFor(endpoint));
+HttpResponse grpcStream(const std::string& endpoint, const AuthSpec& auth,
+                        const std::string& method, const nlohmann::json& params,
+                        const std::function<bool(const nlohmann::json&)>& on_event,
+                        std::stop_token stop, const std::string& protocol_version) {
+    auto stub = pb::A2AService::NewStub(channelFor(endpoint, auth));
     grpc::ClientContext context;
-    configureContext(context, auth, true);
+    configureContext(context, auth, true, protocol_version);
     std::stop_callback cancel(stop, [&context] { context.TryCancel(); });
-    pb::SubscribeToTaskRequest request; request.set_id(task_id);
-    auto reader = stub->SubscribeToTask(&context, request);
     pb::StreamResponse event;
-    while (!stop.stop_requested() && reader->Read(&event)) {
-        std::string json;
-        if (!google::protobuf::util::MessageToJsonString(event, &json).ok()) continue;
-        try { if (!on_event(nlohmann::json::parse(json))) { context.TryCancel(); break; } }
-        catch (...) { /* ignore one malformed conversion */ }
+    auto consume = [&](auto& reader) {
+        while (!stop.stop_requested() && reader->Read(&event)) {
+            std::string json;
+            if (!google::protobuf::util::MessageToJsonString(event, &json).ok()) continue;
+            try { if (!on_event(nlohmann::json::parse(json))) { context.TryCancel(); break; } }
+            catch (...) { /* ignore one malformed conversion */ }
+        }
+        return fromStatus(reader->Finish());
+    };
+    HttpResponse error;
+    if (method == "SubscribeToTask") {
+        pb::SubscribeToTaskRequest request;
+        if (!fromJson(params, &request, &error)) return error;
+        auto reader = stub->SubscribeToTask(&context, request);
+        return consume(reader);
     }
-    return fromStatus(reader->Finish());
+    if (method == "SendStreamingMessage") {
+        pb::SendMessageRequest request;
+        if (!fromJson(params, &request, &error)) return error;
+        auto reader = stub->SendStreamingMessage(&context, request);
+        return consume(reader);
+    }
+    error.status = 400; error.body = "unsupported gRPC stream operation: " + method;
+    return error;
 }
 
 }  // namespace kitty_a2a

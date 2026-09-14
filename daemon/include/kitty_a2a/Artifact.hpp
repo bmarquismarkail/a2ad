@@ -3,6 +3,8 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "kitty_a2a/types.hpp"
 
 namespace kitty_a2a {
@@ -18,6 +20,7 @@ struct Part {
 
     std::string media_type;        // e.g. "text/plain", "application/json"
     std::string filename;          // optional file name
+    nlohmann::json metadata = nlohmann::json::object();
 
     bool empty() const {
         return text.empty() && raw_b64.empty() && url.empty() && data.empty();
@@ -34,6 +37,8 @@ struct Artifact {
     std::string name;              // e.g. "vdp-optimization.patch"
     std::string description;
     std::vector<Part> parts;
+    nlohmann::json metadata = nlohmann::json::object();
+    std::vector<std::string> extensions;
 
     // The best single human-readable representation of the artifact's content,
     // preferring text/data, then URL, then a raw-size note. Used by the task

@@ -7,6 +7,16 @@
 
 namespace kitty_a2a {
 
+struct AuthReference {
+    std::string type = "none";
+    std::string name;
+    std::string scheme;
+    std::string location;
+    std::string parameter;
+    std::string client_cert;
+    std::string client_key;
+};
+
 // Configuration loaded from YAML (DESIGN.md §6, §13, §20).
 //
 // agents.yaml:
@@ -28,6 +38,14 @@ struct AgentConfig {
     // daemon reads the value via CredentialProvider — it is not cached here.
     std::string auth_type = "none";
     std::string auth_name;
+    // Optional card-scheme mapping. The legacy two-field form remains Bearer.
+    std::string auth_scheme;
+    std::string auth_location;
+    std::string auth_parameter;
+    std::string auth_client_cert;
+    std::string auth_client_key;
+    // Preferred v1 form: references keyed by Agent Card security-scheme name.
+    std::map<std::string, AuthReference> auth_schemes;
 
     // Optional static metadata used only until the Agent Card is discovered.
     std::string description;

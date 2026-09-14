@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -53,6 +54,7 @@ static std::string error_kind_str(A2AResult::ErrorKind k) {
 static nlohmann::json taskToJson(const Task& t) {
     nlohmann::json tj;
     tj["task_id"] = t.id.value();
+    tj["remote_task_id"] = t.remote_task_id ? t.remote_task_id->value() : "";
     tj["agent"] = t.agent.value();
     tj["context_id"] = t.context.value();
     tj["state"] = to_state_string(t.state);
@@ -111,6 +113,13 @@ static nlohmann::json agentToJson(const Agent& a) {
         aj["description"] = a.card->description;
         aj["version"] = a.card->version;
         aj["supports_streaming"] = a.card->capabilities.streaming;
+        aj["supports_push_notifications"] = a.card->capabilities.push_notifications;
+        aj["supports_extended_card"] = a.card->capabilities.extended_agent_card;
+        aj["warnings"] = a.card->warnings;
+        nlohmann::json interfaces = nlohmann::json::array();
+        for (const auto& i : a.card->interfaces) interfaces.push_back({{"url", i.url}, {"protocol_binding", i.protocol_binding},
+            {"protocol_version", i.protocol_version}, {"tenant", i.tenant}});
+        aj["interfaces"] = interfaces;
         nlohmann::json skills = nlohmann::json::array();
         for (const auto& s : a.card->skills) {
             skills.push_back({{"id", s.id}, {"name", s.name}, {"description", s.description}});
@@ -118,6 +127,13 @@ static nlohmann::json agentToJson(const Agent& a) {
         aj["skills"] = skills;
     }
     return aj;
+}
+
+static std::string readSecretFile(const std::string& path) {
+    if (path.empty()) return {};
+    std::ifstream input(path); std::string value;
+    std::getline(input, value); if (!value.empty() && value.back() == '\r') value.pop_back();
+    return value;
 }
 
 int main(int argc, char** argv) {
@@ -232,13 +248,61 @@ int main(int argc, char** argv) {
             return {{"ok", true}, {"tasks", arr}};
         }
         if (op == "remote_list") {
-            auto rr = tm.listRemoteTasks(req.value("agent", ""), req.value("context_id", ""),
-                                         req.value("page_size", 100));
+            ListTasksFilter filter;
+            filter.context_id = req.value("context_id", ""); filter.page_size = req.value("page_size", 100);
+            filter.page_token = req.value("page_token", ""); filter.status_timestamp_after = req.value("status_timestamp_after", "");
+            if (req.contains("status") && req["status"].is_string()) filter.status = parse_task_state(req["status"].get<std::string>());
+            if (req.contains("history_length") && req["history_length"].is_number_integer()) filter.history_length = req["history_length"].get<int>();
+            if (req.contains("include_artifacts") && req["include_artifacts"].is_boolean()) filter.include_artifacts = req["include_artifacts"].get<bool>();
+            auto rr = tm.listRemoteTasks(req.value("agent", ""), filter);
             if (!rr.ok) return {{"ok", false}, {"error", rr.error},
                                 {"error_kind", error_kind_str(rr.error_kind)}};
             nlohmann::json arr = nlohmann::json::array();
             for (const auto& task : rr.tasks) arr.push_back(taskToJson(task));
-            return {{"ok", true}, {"tasks", arr}};
+            return {{"ok", true}, {"tasks", arr}, {"next_page_token", rr.next_page_token},
+                    {"page_size", rr.page_size}, {"total_size", rr.total_size}};
+        }
+        if (op == "stream_submit") {
+            nlohmann::json events = nlohmann::json::array();
+            auto rr = tm.streamMessage(req.value("agent", ""), req.value("message", ""),
+                TaskId(req.value("task_id", "")), ContextId(req.value("context_id", "")),
+                [&](const nlohmann::json& event) { events.push_back(event); });
+            if (!rr.ok) return {{"ok", false}, {"error", rr.error}, {"error_kind", error_kind_str(rr.error_kind)}, {"events", events}};
+            return {{"ok", true}, {"events", events}};
+        }
+        if (op == "subscribe") {
+            nlohmann::json updates = nlohmann::json::array();
+            auto rr = tm.subscribeTask(req.value("task_id", ""), [&](const Task& task) { updates.push_back(taskToJson(task)); });
+            if (!rr.ok) return {{"ok", false}, {"error", rr.error}, {"error_kind", error_kind_str(rr.error_kind)}, {"updates", updates}};
+            return {{"ok", true}, {"updates", updates}};
+        }
+        if (op == "push.create") {
+            PushNotificationConfig pc;
+            pc.id = req.value("id", ""); pc.task_id = req.value("task_id", ""); pc.url = req.value("url", "");
+            if (pc.url.rfind("https://", 0) != 0) return {{"ok", false}, {"error", "push callback URL must use HTTPS"}};
+            pc.token = readSecretFile(req.value("token_file", "")); pc.auth_scheme = req.value("auth_scheme", "");
+            pc.auth_credentials = readSecretFile(req.value("auth_file", ""));
+            auto rr = tm.createPushConfig(req.value("agent", ""), pc);
+            if (!rr.ok) return {{"ok", false}, {"error", rr.error}, {"error_kind", error_kind_str(rr.error_kind)}};
+            nlohmann::json value = rr.value;
+            if (value.is_object()) { value.erase("token"); if (value.contains("authentication")) value["authentication"].erase("credentials"); }
+            return {{"ok", true}, {"config", value}};
+        }
+        if (op == "push.get" || op == "push.list" || op == "push.delete") {
+            A2AResult rr;
+            if (op == "push.get") rr = tm.getPushConfig(req.value("agent", ""), req.value("task_id", ""), req.value("id", ""));
+            else if (op == "push.list") rr = tm.listPushConfigs(req.value("agent", ""), req.value("task_id", ""), req.value("page_size", 50), req.value("page_token", ""));
+            else rr = tm.deletePushConfig(req.value("agent", ""), req.value("task_id", ""), req.value("id", ""));
+            if (!rr.ok) return {{"ok", false}, {"error", rr.error}, {"error_kind", error_kind_str(rr.error_kind)}};
+            nlohmann::json value = rr.value;
+            auto redact = [](nlohmann::json& item) { if (!item.is_object()) return; item.erase("token"); if (item.contains("authentication")) item["authentication"].erase("credentials"); };
+            if (value.contains("configs") && value["configs"].is_array()) for (auto& item : value["configs"]) redact(item); else redact(value);
+            return {{"ok", true}, {"result", value}};
+        }
+        if (op == "agent.extended_card") {
+            auto rr = tm.getExtendedAgentCard(req.value("agent", ""));
+            if (!rr.ok) return {{"ok", false}, {"error", rr.error}, {"error_kind", error_kind_str(rr.error_kind)}};
+            return {{"ok", true}, {"card", rr.value}};
         }
         if (op == "status") {
             std::string id = req.value("task_id", "");
@@ -262,7 +326,7 @@ int main(int argc, char** argv) {
             std::string id = req.value("task_id", "");
             auto rr = tm.cancelTask(id);
             if (!rr.ok) return {{"ok", false}, {"error", rr.error}, {"error_kind", error_kind_str(rr.error_kind)}};
-            return {{"ok", true}, {"task_id", id}, {"state", "CANCELED"}};
+            return {{"ok", true}, {"task_id", id}, {"state", rr.task ? to_state_string(rr.task->state) : "UNKNOWN"}};
         }
         if (op == "agents") {
             nlohmann::json arr = nlohmann::json::array();

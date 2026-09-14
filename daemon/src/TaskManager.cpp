@@ -8,6 +8,8 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <random>
+#include <iomanip>
 
 namespace fs = std::filesystem;
 
@@ -22,6 +24,18 @@ std::string now_iso() {
     char buf[32];
     std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
     return buf;
+}
+
+std::string local_interaction_id() {
+    std::random_device rd; std::mt19937_64 gen(rd());
+    std::uniform_int_distribution<unsigned long long> dist;
+    auto a = dist(gen), b = dist(gen); unsigned char bytes[16];
+    for (int i = 0; i < 8; ++i) bytes[i] = static_cast<unsigned char>(a >> (i * 8));
+    for (int i = 0; i < 8; ++i) bytes[8 + i] = static_cast<unsigned char>(b >> (i * 8));
+    bytes[6] = (bytes[6] & 15) | 64; bytes[8] = (bytes[8] & 63) | 128;
+    std::ostringstream out;
+    for (int i = 0; i < 16; ++i) { if (i == 4 || i == 6 || i == 8 || i == 10) out << '-'; out << std::hex << std::setw(2) << std::setfill('0') << int(bytes[i]); }
+    return out.str();
 }
 
 // Derive a short human title from a message (first ~40 chars, first line).
@@ -81,15 +95,29 @@ TaskManager::TaskManager(Database& db, std::shared_ptr<A2AClient> a2a, const Con
     for (Agent a : db_.loadAgents()) {
         agents_[a.id.value()] = std::move(a);
     }
-    // Ensure config-defined agents exist in memory even if not yet discovered.
+    // Configuration is authoritative for routing. Persisted agents retain a
+    // cached card and health state across restarts, but an endpoint change must
+    // invalidate that cache so startup discovery cannot keep using stale
+    // interfaces from the database.
     for (const auto& [id, ac] : config_.agents) {
-        if (agents_.find(id) == agents_.end()) {
+        auto it = agents_.find(id);
+        if (it == agents_.end()) {
             Agent a;
             a.id = id;
             a.endpoint = ac.endpoint;
             a.host_label = ac.host_label.empty() ? id : ac.host_label;
             agents_[id] = a;
+            continue;
         }
+
+        Agent& persisted = it->second;
+        if (persisted.endpoint != ac.endpoint) {
+            persisted.endpoint = ac.endpoint;
+            persisted.card.reset();
+            persisted.available = false;
+            persisted.last_error.clear();
+        }
+        persisted.host_label = ac.host_label.empty() ? id : ac.host_label;
     }
 }
 
@@ -103,18 +131,36 @@ void TaskManager::startSubscriptions() {
 
 void TaskManager::startSubscription(const Task& task) {
     auto agent = agents_.find(task.agent.value());
-    if (agent == agents_.end() || !agent->second.supports_streaming() || is_terminal(task.state)) return;
+    if (agent == agents_.end() || !agent->second.supports_streaming() || is_terminal(task.state) ||
+        !task.remote_task_id || task.remote_task_id->empty()) return;
     const std::string task_id = task.id.value();
+    const std::string remote_task_id = task.remote_task_id->value();
     const AgentId agent_id = task.agent;
-    subscriptions_.emplace_back([this, task_id, agent_id](std::stop_token stop) {
+    subscriptions_.emplace_back([this, task_id, remote_task_id, agent_id](std::stop_token stop) {
             while (!stop.stop_requested()) {
                 std::string endpoint; AuthSpec auth;
                 if (!resolveEndpoint(agent_id, &endpoint, &auth)) return;
-                a2a_->subscribeToTask(endpoint, auth, TaskId(task_id), [this, task_id](const Task& update) {
+                a2a_->subscribeToTask(endpoint, auth, TaskId(remote_task_id), [this, task_id](const Task& update) {
                     auto existing = db_.getTask(task_id);
                     if (!existing) return;
-                    Task merged = update;
-                    if (merged.id.empty()) merged.id = existing->id;
+                    Task merged = update.partial_update ? *existing : update;
+                    if (update.partial_update) {
+                        if (update.has_state_update) {
+                            merged.state = update.state; merged.state_message = update.state_message;
+                            merged.last_state_change = update.last_state_change;
+                        }
+                        if (!update.context.empty()) merged.context = update.context;
+                        for (const auto& message : update.messages) merged.messages.push_back(message);
+                        for (const auto& artifact : update.artifacts) {
+                            auto found = std::find_if(merged.artifacts.begin(), merged.artifacts.end(), [&](const Artifact& a) { return a.artifact_id == artifact.artifact_id; });
+                            if (found == merged.artifacts.end()) merged.artifacts.push_back(artifact);
+                            else if (update.artifact_append) found->parts.insert(found->parts.end(), artifact.parts.begin(), artifact.parts.end());
+                            else *found = artifact;
+                        }
+                        if (!update.metadata.empty()) merged.metadata.update(update.metadata);
+                    }
+                    if (!merged.remote_task_id) merged.remote_task_id = update.id;
+                    merged.id = existing->id;
                     merged.agent = existing->agent; merged.title = existing->title;
                     merged.cwd = existing->cwd; merged.created_at = existing->created_at;
                     merged.updated_at = now_iso();
@@ -122,6 +168,8 @@ void TaskManager::startSubscription(const Task& task) {
                     emitStateChanged(task_id, existing->state, merged.state);
                 }, stop);
                 if (stop.stop_requested()) return;
+                auto current = db_.getTask(task_id);
+                if (!current || is_terminal(current->state)) return;
                 for (int i = 0; i < 20 && !stop.stop_requested(); ++i)
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
@@ -134,16 +182,95 @@ bool TaskManager::resolveEndpoint(const AgentId& id, std::string* endpoint, Auth
     const Agent& a = it->second;
     *endpoint = a.effective_endpoint();
 
-    // Resolve auth from the config's non-secret reference.
+    // Resolve auth from non-secret references. The v1 form is keyed by Agent
+    // Card scheme name so conjunctive requirements can be satisfied; the flat
+    // form remains backward-compatible Bearer shorthand.
     auto cit = config_.agents.find(id.value());
-    std::string auth_type = "none", auth_name;
-    if (cit != config_.agents.end()) {
-        auth_type = cit->second.auth_type;
-        auth_name = cit->second.auth_name;
+    if (cit == config_.agents.end() || !a2a_ || !a2a_->credentials()) return true;
+    const AgentConfig& configured = cit->second;
+
+    auto apply = [&](AuthSpec resolved, const AuthReference& reference,
+                     const SecurityScheme* advertised) {
+        std::string secret = resolved.header_value;
+        if (secret.rfind("Bearer ", 0) == 0) secret.erase(0, 7);
+        std::string scheme = reference.scheme;
+        std::string location = reference.location;
+        std::string parameter = reference.parameter;
+        if (advertised) {
+            if (scheme.empty()) scheme = advertised->type == "http" ? advertised->scheme : advertised->type;
+            if (location.empty()) location = advertised->location;
+            if (parameter.empty()) parameter = advertised->parameter;
+        }
+        std::string lower = scheme; std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
+        std::string header_name = resolved.header_name, header_value = resolved.header_value;
+        if (lower == "apikey") {
+            if (location == "query") {
+                if (auth->query_name.empty()) { auth->query_name = parameter; auth->query_value = secret; }
+                else auth->extra_query.emplace_back(parameter, secret);
+                header_name.clear(); header_value.clear();
+            }
+            else if (location == "cookie") {
+                if (!auth->cookie_value.empty()) auth->cookie_value += "; ";
+                auth->cookie_value += (parameter.empty() ? "api_key" : parameter) + "=" + secret;
+                header_name.clear(); header_value.clear();
+            } else { header_name = parameter.empty() ? "X-API-Key" : parameter; header_value = secret; }
+        } else if (lower == "basic") header_value = "Basic " + secret;
+        else if (!lower.empty() && lower != "bearer" && lower != "oauth2" && lower != "openidconnect")
+            header_value = scheme + " " + secret;
+        if (!header_value.empty()) {
+            if (auth->header_value.empty()) { auth->header_name = header_name; auth->header_value = header_value; }
+            else auth->extra_headers.emplace_back(header_name, header_value);
+        }
+        if (!reference.client_cert.empty()) auth->client_cert_file = reference.client_cert;
+        if (!reference.client_key.empty()) auth->client_key_file = reference.client_key;
+        auth->active = auth->active || resolved.active || !reference.client_cert.empty();
+    };
+
+    if (!configured.auth_schemes.empty()) {
+        std::vector<std::string> selected_names;
+        bool selected = false;
+        if (a.card && !a.card->security_requirements.empty()) {
+            for (const auto& requirement : a.card->security_requirements) {
+                bool satisfiable = true;
+                for (const auto& [name, scopes] : requirement.schemes)
+                    if (!configured.auth_schemes.contains(name)) { satisfiable = false; break; }
+                if (satisfiable) {
+                    for (const auto& [name, scopes] : requirement.schemes) selected_names.push_back(name);
+                    selected = true; break;
+                }
+            }
+        } else {
+            selected_names.push_back(configured.auth_schemes.begin()->first);
+            selected = true;
+        }
+        if (!selected) { auth->scheme = "error"; return true; }
+        for (const auto& name : selected_names) {
+            const auto& reference = configured.auth_schemes.at(name);
+            AuthSpec resolved = a2a_->credentials()->resolve(reference.type, reference.name);
+            const SecurityScheme* advertised = nullptr;
+            if (a.card) { auto found = a.card->security_schemes.find(name); if (found != a.card->security_schemes.end()) advertised = &found->second; }
+            if (!resolved.active && reference.client_cert.empty()) { auth->scheme = "error"; auth->active = false; return true; }
+            apply(std::move(resolved), reference, advertised);
+        }
+    } else {
+        AuthReference reference;
+        reference.type = configured.auth_type; reference.name = configured.auth_name;
+        reference.scheme = configured.auth_scheme; reference.location = configured.auth_location;
+        reference.parameter = configured.auth_parameter; reference.client_cert = configured.auth_client_cert;
+        reference.client_key = configured.auth_client_key;
+        AuthSpec resolved = a2a_->credentials()->resolve(reference.type, reference.name);
+        const SecurityScheme* advertised = nullptr;
+        if (reference.scheme.empty() && a.card) {
+            for (const auto& requirement : a.card->security_requirements) {
+                if (requirement.schemes.size() != 1) continue;
+                auto found = a.card->security_schemes.find(requirement.schemes.begin()->first);
+                if (found != a.card->security_schemes.end()) { advertised = &found->second; break; }
+            }
+            if (!advertised && a.card->security_schemes.size() == 1) advertised = &a.card->security_schemes.begin()->second;
+        }
+        apply(std::move(resolved), reference, advertised);
     }
-    if (a2a_ && a2a_->credentials()) {
-        *auth = a2a_->credentials()->resolve(auth_type, auth_name);
-    }
+    if (!auth->cookie_value.empty()) auth->extra_headers.emplace_back("Cookie", auth->cookie_value);
     return true;
 }
 
@@ -156,12 +283,14 @@ void TaskManager::reconcileOnStartup() {
                          t.agent.value().c_str(), t.id.value().c_str());
             continue;
         }
-        A2AResult r = a2a_->getTask(endpoint, auth, t.id);
+        if (!t.remote_task_id || t.remote_task_id->empty()) continue;
+        A2AResult r = a2a_->getTask(endpoint, auth, *t.remote_task_id);
         if (r.ok && r.task) {
             // Merge the fresh remote state into the persisted task.
             Task fresh = std::move(*r.task);
             // Preserve local bookkeeping fields.
-            if (fresh.id.empty()) fresh.id = t.id;
+            if (!fresh.remote_task_id) fresh.remote_task_id = fresh.id;
+            fresh.id = t.id;
             if (fresh.title.empty()) fresh.title = t.title;
             if (fresh.cwd.empty()) fresh.cwd = t.cwd;
             if (fresh.created_at.empty()) fresh.created_at = t.created_at;
@@ -223,18 +352,18 @@ CreateTaskResponse TaskManager::createTask(const CreateTaskRequest& req) {
         if (t.created_at.empty()) t.created_at = now_iso();
     } else {
         // The agent replied with a bare Message (no task object).
-        t.id = "msg-" + std::to_string(std::time(nullptr));
+        t.id = local_interaction_id();
+        t.remote_task_id = std::nullopt;
         t.agent = req.agent;
         t.context = r.context_id;
-        t.state = TaskState::Submitted;
+        t.state = TaskState::Completed;
         t.title = titleFromMessage(req.message);
         t.cwd = req.context.cwd;
         t.created_at = now_iso();
-        Message m;
-        m.role = "agent";
-        m.message_id = "m0";
-        Part p; p.text = r.message_text;
-        m.parts.push_back(p);
+        Message m = r.message.value_or(Message{});
+        if (m.role.empty()) m.role = "agent";
+        if (m.message_id.empty()) m.message_id = local_interaction_id();
+        if (m.parts.empty()) { Part p; p.text = r.message_text; m.parts.push_back(p); }
         t.messages.push_back(std::move(m));
         t.updated_at = now_iso();
     }
@@ -248,7 +377,7 @@ CreateTaskResponse TaskManager::createTask(const CreateTaskRequest& req) {
     resp.task_id = t.id;
     resp.context_id = t.context;
     resp.state = t.state;
-    resp.message = "task submitted";
+    resp.message = t.remote_task_id ? "task submitted" : "interaction completed";
     return resp;
 }
 
@@ -269,7 +398,9 @@ CreateTaskResponse TaskManager::respondToTask(const std::string& task_id, const 
         resp.message = "unknown agent for task";
         return resp;
     }
-    A2AResult r = a2a_->sendMessage(endpoint, auth, response_text, existing->id, existing->context);
+    TaskId remote_id;
+    if (existing->remote_task_id) remote_id = *existing->remote_task_id;
+    A2AResult r = a2a_->sendMessage(endpoint, auth, response_text, remote_id, existing->context);
     if (!r.ok) {
         resp.ok = false;
         resp.error_kind = error_kind_name(r.error_kind);
@@ -279,10 +410,16 @@ CreateTaskResponse TaskManager::respondToTask(const std::string& task_id, const 
     Task t = existing ? *existing : Task{};
     if (r.task) {
         t = std::move(*r.task);
+        if (!t.remote_task_id) t.remote_task_id = t.id;
+        t.id = existing->id;
         t.title = existing->title;
         t.cwd = existing->cwd;
         t.created_at = existing->created_at;
         t.agent = existing->agent;
+    } else if (r.message) {
+        t.messages.push_back(*r.message);
+        t.state = TaskState::Completed;
+        if (!r.context_id.empty()) t.context = r.context_id;
     }
     t.updated_at = now_iso();
     t.last_state_change = now_iso();
@@ -310,10 +447,16 @@ A2AResult TaskManager::cancelTask(const std::string& task_id) {
         r.error = "unknown agent";
         return r;
     }
-    A2AResult r = a2a_->cancelTask(endpoint, auth, existing->id);
-    if (r.ok) {
-        Task t = *existing;
-        t.state = TaskState::Canceled;
+    if (!existing->remote_task_id || existing->remote_task_id->empty()) {
+        A2AResult r; r.error_kind = A2AResult::ErrorKind::ProtocolError;
+        r.error = "interaction has no remote task and cannot be canceled"; return r;
+    }
+    A2AResult r = a2a_->cancelTask(endpoint, auth, *existing->remote_task_id);
+    if (r.ok && r.task) {
+        Task t = std::move(*r.task);
+        if (!t.remote_task_id) t.remote_task_id = t.id;
+        t.id = existing->id; t.agent = existing->agent; t.title = existing->title;
+        t.cwd = existing->cwd; t.created_at = existing->created_at;
         t.updated_at = now_iso();
         t.last_state_change = now_iso();
         db_.updateTask(t);
@@ -336,10 +479,14 @@ A2AResult TaskManager::refreshTask(const std::string& task_id) {
         r.error = "unknown agent";
         return r;
     }
-    A2AResult r = a2a_->getTask(endpoint, auth, existing->id);
+    if (!existing->remote_task_id || existing->remote_task_id->empty()) {
+        A2AResult r; r.ok = true; r.task = *existing; r.context_id = existing->context.value(); return r;
+    }
+    A2AResult r = a2a_->getTask(endpoint, auth, *existing->remote_task_id);
     if (r.ok && r.task) {
         Task t = std::move(*r.task);
-        if (t.id.empty()) t.id = existing->id;
+        if (!t.remote_task_id) t.remote_task_id = t.id;
+        t.id = existing->id;
         t.title = existing->title;
         t.cwd = existing->cwd;
         t.created_at = existing->created_at;
@@ -371,14 +518,65 @@ std::vector<TaskSummary> TaskManager::listTasks(bool include_terminal) {
 
 A2AResult TaskManager::listRemoteTasks(const std::string& agent, const std::string& context_id,
                                        int page_size) {
+    ListTasksFilter filter; filter.context_id = context_id; filter.page_size = page_size;
+    return listRemoteTasks(agent, filter);
+}
+
+A2AResult TaskManager::listRemoteTasks(const std::string& agent, const ListTasksFilter& filter) {
     std::string endpoint; AuthSpec auth;
     if (!resolveEndpoint(AgentId(agent), &endpoint, &auth)) {
         A2AResult r; r.error_kind = A2AResult::ErrorKind::ProtocolError;
         r.error = "unknown agent: " + agent; return r;
     }
-    A2AResult r = a2a_->listTasks(endpoint, auth, context_id, page_size);
+    A2AResult r = a2a_->listTasks(endpoint, auth, filter);
     if (r.ok) for (auto& task : r.tasks) if (task.agent.empty()) task.agent = agent;
     return r;
+}
+
+A2AResult TaskManager::streamMessage(const std::string& agent, const std::string& message,
+                                     const TaskId& task_id, const ContextId& context_id,
+                                     const std::function<void(const nlohmann::json&)>& on_event,
+                                     std::stop_token stop) {
+    std::string endpoint; AuthSpec auth;
+    if (!resolveEndpoint(AgentId(agent), &endpoint, &auth)) {
+        A2AResult r; r.error_kind = A2AResult::ErrorKind::ProtocolError; r.error = "unknown agent: " + agent; return r;
+    }
+    return a2a_->sendStreamingMessage(endpoint, auth, message, task_id, context_id, on_event, stop);
+}
+
+A2AResult TaskManager::subscribeTask(const std::string& local_task_id,
+                                     const std::function<void(const Task&)>& on_task,
+                                     std::stop_token stop) {
+    auto task = db_.getTask(local_task_id);
+    if (!task || !task->remote_task_id) {
+        A2AResult r; r.error_kind = A2AResult::ErrorKind::ProtocolError; r.error = "task has no remote task id"; return r;
+    }
+    std::string endpoint; AuthSpec auth;
+    if (!resolveEndpoint(task->agent, &endpoint, &auth)) {
+        A2AResult r; r.error_kind = A2AResult::ErrorKind::ProtocolError; r.error = "unknown task agent"; return r;
+    }
+    return a2a_->subscribeToTask(endpoint, auth, *task->remote_task_id, on_task, stop);
+}
+
+A2AResult TaskManager::createPushConfig(const std::string& agent, const PushNotificationConfig& config) {
+    std::string endpoint; AuthSpec auth; if (!resolveEndpoint(AgentId(agent), &endpoint, &auth)) { A2AResult r; r.error = "unknown agent: " + agent; return r; }
+    return a2a_->createPushConfig(endpoint, auth, config);
+}
+A2AResult TaskManager::getPushConfig(const std::string& agent, const std::string& task_id, const std::string& id) {
+    std::string endpoint; AuthSpec auth; if (!resolveEndpoint(AgentId(agent), &endpoint, &auth)) { A2AResult r; r.error = "unknown agent: " + agent; return r; }
+    return a2a_->getPushConfig(endpoint, auth, task_id, id);
+}
+A2AResult TaskManager::listPushConfigs(const std::string& agent, const std::string& task_id, int page_size, const std::string& page_token) {
+    std::string endpoint; AuthSpec auth; if (!resolveEndpoint(AgentId(agent), &endpoint, &auth)) { A2AResult r; r.error = "unknown agent: " + agent; return r; }
+    return a2a_->listPushConfigs(endpoint, auth, task_id, page_size, page_token);
+}
+A2AResult TaskManager::deletePushConfig(const std::string& agent, const std::string& task_id, const std::string& id) {
+    std::string endpoint; AuthSpec auth; if (!resolveEndpoint(AgentId(agent), &endpoint, &auth)) { A2AResult r; r.error = "unknown agent: " + agent; return r; }
+    return a2a_->deletePushConfig(endpoint, auth, task_id, id);
+}
+A2AResult TaskManager::getExtendedAgentCard(const std::string& agent) {
+    std::string endpoint; AuthSpec auth; if (!resolveEndpoint(AgentId(agent), &endpoint, &auth)) { A2AResult r; r.error = "unknown agent: " + agent; return r; }
+    return a2a_->getExtendedAgentCard(endpoint, auth);
 }
 
 bool TaskManager::materializeArtifact(const std::string& task_id, const std::string& artifact_id,
@@ -451,7 +649,12 @@ Agent TaskManager::discoverAgent(const std::string& id) {
     AgentCard card = a2a_->discover(a.endpoint);
     a.card = card;
     a.available = card.valid;
-    a.last_error = card.valid ? "" : card.parse_error;
+    if (card.valid) {
+        std::ostringstream warning;
+        for (size_t i = 0; i < card.warnings.size(); ++i) { if (i) warning << "; "; warning << card.warnings[i]; }
+        a.last_error = warning.str();
+        if (auto interface = a.effective_interface()) a2a_->registerInterface(*interface);
+    } else a.last_error = card.parse_error;
 
     // Persist a compact card snapshot (only the interaction-relevant fields).
     nlohmann::json cj;
@@ -470,6 +673,7 @@ Agent TaskManager::discoverAgent(const std::string& id) {
             {"url", i.url},
             {"protocolBinding", i.protocol_binding},
             {"protocolVersion", i.protocol_version},
+            {"tenant", i.tenant},
         });
     }
     cj["auth_schemes"] = card.auth_schemes;
