@@ -108,8 +108,13 @@ ControlPlane::ControlPlane(const std::string& path, bool enforce) : enforce_(enf
             "CREATE TABLE IF NOT EXISTS control_events(sequence INTEGER PRIMARY KEY AUTOINCREMENT,time INTEGER NOT NULL,value TEXT NOT NULL,previous_hash TEXT NOT NULL,hash TEXT NOT NULL);"
             "CREATE TRIGGER IF NOT EXISTS control_events_no_update BEFORE UPDATE ON control_events BEGIN SELECT RAISE(ABORT,'audit is append-only'); END;"
             "CREATE TRIGGER IF NOT EXISTS control_events_no_delete BEFORE DELETE ON control_events BEGIN SELECT RAISE(ABORT,'audit is append-only'); END;");
+        if (sqlite3_open_v2(path.c_str(), &read_db_, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nullptr) != SQLITE_OK) {
+            sqlite3_close(read_db_); read_db_ = nullptr;
+            throw std::runtime_error("cannot open read-only control-plane connection");
+        }
+        sqlite3_busy_timeout(read_db_, 5000);
         Transaction tx(db_);
-        for (auto execution : list("execution")) {
+        for (auto execution : list("execution", db_)) {
             if (execution.value("state", "") == "DISPATCHING") {
                 execution["state"] = "UNCERTAIN";
                 execution["reason"] = "daemon restarted during dispatch; reconcile remote state before any new attempt";
@@ -118,11 +123,12 @@ ControlPlane::ControlPlane(const std::string& path, bool enforce) : enforce_(enf
             }
         }
         tx.commit();
-    } catch (...) { sqlite3_close(db_); db_ = nullptr; throw; }
+    } catch (...) { sqlite3_close(read_db_); read_db_ = nullptr; sqlite3_close(db_); db_ = nullptr; throw; }
 }
-ControlPlane::~ControlPlane() { sqlite3_close(db_); }
-ControlPlane::Json ControlPlane::read(const std::string& kind, const std::string& id) {
-    Statement st(db_, "SELECT value FROM control_records WHERE kind=? AND id=?");
+ControlPlane::~ControlPlane() { sqlite3_close(read_db_); sqlite3_close(db_); }
+ControlPlane::Json ControlPlane::read(const std::string& kind, const std::string& id, sqlite3* database) {
+    sqlite3* db = database ? database : db_;
+    Statement st(db, "SELECT value FROM control_records WHERE kind=? AND id=?");
     st.bind(1, kind); st.bind(2, id);
     return st.row() ? J::parse(st.text(0)) : J();
 }
@@ -130,8 +136,9 @@ void ControlPlane::write(const std::string& kind, const std::string& id, const J
     Statement st(db_, "INSERT INTO control_records VALUES(?,?,?) ON CONFLICT(kind,id) DO UPDATE SET value=excluded.value");
     st.bind(1, kind); st.bind(2, id); st.bind(3, value.dump()); st.row();
 }
-ControlPlane::Json ControlPlane::list(const std::string& kind) {
-    Statement st(db_, "SELECT value FROM control_records WHERE kind=? ORDER BY id"); st.bind(1, kind);
+ControlPlane::Json ControlPlane::list(const std::string& kind, sqlite3* database) {
+    sqlite3* db = database ? database : db_;
+    Statement st(db, "SELECT value FROM control_records WHERE kind=? ORDER BY id"); st.bind(1, kind);
     J values = J::array(); while (st.row()) values.push_back(J::parse(st.text(0))); return values;
 }
 void ControlPlane::append(const J& value) {
@@ -306,6 +313,69 @@ ControlPlane::Json ControlPlane::control(const J& req) {
     return J();
 }
 
+ControlPlane::Json ControlPlane::readOnly(const J& req) {
+    const auto op = req.value("op", "");
+    const bool list_op = op == "execution.list" || op == "session.list" || op == "approval.list" ||
+        op == "provenance.list" || op == "continuation.list";
+    if (op == "policy.info") return { {"ok", true}, {"enforce", enforce_}, {"effects", effects},
+        {"authority", "local socket owner; worker isolation must exclude this socket and database"} };
+    if (list_op) {
+        const auto kind = op.substr(0, op.find('.'));
+        const bool paged = req.contains("limit") || req.contains("after");
+        if (!paged) {
+            auto items = list(kind, read_db_);
+            if (kind == "execution") {
+                J filtered = J::array();
+                for (const auto& item : items) {
+                    if (req.contains("session_id") && item.value("session_id", "") != req.at("session_id").get<std::string>()) continue;
+                    if (req.contains("task_id") && item.value("task_id", "") != req.at("task_id").get<std::string>()) continue;
+                    filtered.push_back(item);
+                }
+                items = std::move(filtered);
+            }
+            return {{"ok", true}, {"items", items}};
+        }
+        if ((req.contains("after") && !req.at("after").is_string()) ||
+            (req.contains("limit") && (!req.at("limit").is_number_integer() || req.at("limit").get<int>() < 1 || req.at("limit").get<int>() > 500)))
+            return failure("invalid_request", "after must be a string and limit must be 1..500");
+        const std::string after = req.value("after", "");
+        const int limit = req.value("limit", 100);
+        Statement st(read_db_, "SELECT id,value FROM control_records WHERE kind=? AND id>? ORDER BY id LIMIT ?");
+        st.bind(1, kind); st.bind(2, after); sqlite3_bind_int(st.st, 3, limit + 1);
+        J items = J::array(); std::string next; bool more = false;
+        while (st.row()) {
+            auto id = st.text(0);
+            if (items.size() == static_cast<size_t>(limit)) { more = true; break; }
+            auto item = J::parse(st.text(1));
+            if (kind == "execution") {
+                if (req.contains("session_id") && item.value("session_id", "") != req.at("session_id").get<std::string>()) continue;
+                if (req.contains("task_id") && item.value("task_id", "") != req.at("task_id").get<std::string>()) continue;
+            }
+            items.push_back(std::move(item));
+            next = id;
+        }
+        J result = {{"ok", true}, {"items", items}};
+        if (more) result["next_cursor"] = next;
+        return result;
+    }
+    if (op == "execution.get" || op == "session.get") {
+        auto item = read(op.substr(0, op.find('.')), required(req, "id"), read_db_);
+        if (item.is_null()) return failure("not_found", "record not found");
+        return {{"ok", true}, {"record", item}};
+    }
+    if (op == "audit.verify") {
+        Statement st(read_db_, "SELECT time,value,previous_hash,hash FROM control_events ORDER BY sequence");
+        std::string previous; int64_t count = 0;
+        while (st.row()) {
+            auto expected = digest(previous + "\n" + std::to_string(sqlite3_column_int64(st.st, 0)) + "\n" + st.text(1));
+            if (previous != st.text(2) || expected != st.text(3)) return failure("integrity_failure", "audit chain mismatch");
+            previous = st.text(3); ++count;
+        }
+        return {{"ok", true}, {"count", count}, {"head_sha256", previous}};
+    }
+    return J();
+}
+
 ControlPlane::Json ControlPlane::begin(const J& req) {
     const auto id = required(req, "request_id"); const auto hash = digest(canonical(req).dump());
     auto prior = read("execution", id);
@@ -417,6 +487,13 @@ void ControlPlane::finish(const std::string& id, const J& result) {
 ControlPlane::Json ControlPlane::handle(const J& req, const Dispatch& dispatch) {
     try {
         if (!req.is_object()) return failure("invalid_request", "request must be an object");
+        const auto op = req.value("op", "");
+        if (op == "policy.info" || op == "execution.list" || op == "session.list" || op == "approval.list" ||
+            op == "provenance.list" || op == "continuation.list" || op == "execution.get" || op == "session.get" ||
+            op == "audit.verify") {
+            auto result = readOnly(req);
+            if (!result.is_null()) return result;
+        }
         {
             std::lock_guard lock(mutex_); Transaction tx(db_);
             auto result = control(req);

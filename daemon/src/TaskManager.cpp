@@ -388,8 +388,8 @@ CreateTaskResponse TaskManager::createTask(const CreateTaskRequest& req) {
     t.last_state_change = now_iso();
 
     db_.insertTask(t);
-    startSubscription(t);
     if (event_sink_) event_sink_({{"type", "task.created"}, {"task_id", t.id.value()}, {"state", to_state_string(t.state)}});
+    startSubscription(t);
 
     resp.ok = true;
     resp.task_id = t.id;
@@ -637,7 +637,9 @@ bool TaskManager::materializeArtifact(const std::string& task_id, const std::str
     } else { if (error) *error = "artifact part has no materializable content"; return false; }
 
     const auto sha256 = ControlPlane::digest(bytes);
-    std::string expected = expected_sha256.empty() ? part.metadata.value("sha256", "") : expected_sha256;
+    std::string expected = expected_sha256;
+    if (expected.empty() && part.metadata.is_object() && part.metadata.contains("sha256") && part.metadata["sha256"].is_string())
+        expected = part.metadata["sha256"].get<std::string>();
     if (!expected.empty() && expected != sha256) {
         if (error) *error = "artifact SHA-256 mismatch";
         return false;

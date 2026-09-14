@@ -81,6 +81,7 @@ struct HttpResponse {
     bool transport_error = false;   // connection failed / TLS error, etc.
     std::string transport_error_detail;
     std::map<std::string, std::string> headers = {}; // lowercase response header names
+    bool response_too_large = false;
 };
 class HttpTransport {
 public:

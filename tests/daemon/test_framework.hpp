@@ -50,7 +50,7 @@ inline void register_one(const char* name, std::function<void()> fn) {
 inline int run_all() {
     const char* exclude = std::getenv("A2AD_TEST_EXCLUDE");
     for (auto& t : registry()) {
-        if (exclude && t.name.find(exclude) != std::string::npos) {
+        if (exclude && *exclude != '\0' && t.name.find(exclude) != std::string::npos) {
             std::fprintf(stderr, "  SKIP %s (A2AD_TEST_EXCLUDE)\n", t.name.c_str());
             continue;
         }

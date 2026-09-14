@@ -167,7 +167,7 @@ int main(int argc, char** argv) {
     // Load config.
     std::string cfg_err;
     Config config = load_config(config_path, /*require=*/false, &cfg_err);
-    if (!cfg_err.empty()) std::fprintf(stderr, "[a2ad] config: %s\n", cfg_err.c_str());
+    if (!cfg_err.empty()) { std::fprintf(stderr, "[a2ad] config: %s\n", cfg_err.c_str()); return 1; }
     if (config.agents.empty()) {
         std::fprintf(stderr, "[a2ad] no agents configured (config: %s); daemon idle\n", config_path.c_str());
     }
@@ -219,7 +219,13 @@ int main(int argc, char** argv) {
     auto transport = make_curl_transport(30000);
     auto a2a = std::make_shared<A2AClient>(transport, creds_shared);
 
-    ControlPlane control(paths.db, config.enforce_policy);
+    std::unique_ptr<ControlPlane> control_ptr;
+    try { control_ptr = std::make_unique<ControlPlane>(paths.db, config.enforce_policy); }
+    catch (const std::exception& e) {
+        std::fprintf(stderr, "[a2ad] fatal: control-plane initialization failed: %s\n", e.what());
+        return 1;
+    }
+    ControlPlane& control = *control_ptr;
     TaskManager tm(db, a2a, config);
 
     // Build the IPC server. The handler is a reference into a shared struct so

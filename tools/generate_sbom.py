@@ -26,7 +26,10 @@ for dependency in sorted(args.dependency):
         component["version"] = version
     components.append(component)
 with args.binary.open("rb") as binary:
-    digest = hashlib.file_digest(binary, "sha256").hexdigest()
+    hasher = hashlib.sha256()
+    for chunk in iter(lambda: binary.read(1024 * 1024), b""):
+        hasher.update(chunk)
+    digest = hasher.hexdigest()
 bom = {
     "bomFormat": "CycloneDX", "specVersion": "1.5", "version": 1,
     "metadata": {"component": {
