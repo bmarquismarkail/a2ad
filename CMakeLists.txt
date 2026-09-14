@@ -83,7 +83,7 @@ target_include_directories(a2ad_core PUBLIC daemon/include PRIVATE ${CMAKE_CURRE
 target_link_libraries(a2ad_core PUBLIC
     nlohmann_json::nlohmann_json
     CURL::libcurl
-    SQLite3::SQLite3
+    SQLite::SQLite3
     OpenSSL::Crypto
     yaml-cpp::yaml-cpp
     Threads::Threads
