@@ -406,7 +406,7 @@ A2AResult A2AClient::rpcCall(const std::string& endpoint, const AuthSpec& auth,
         r = transport_->request(target, "POST", "", req.dump(), headers);
     }
     if (r.response_too_large) {
-        out.ok = false; out.error_kind = A2AResult::ErrorKind::ProtocolError;
+        out.ok = false; out.error_kind = A2AResult::ErrorKind::MalformedResponse;
         out.error = "A2A response exceeds the 64 MiB limit";
         return out;
     }

@@ -26,7 +26,7 @@ else()
 endif()
 
 # libcurl
-find_package(CURL REQUIRED)
+find_package(CURL 7.85.0 REQUIRED)
 
 # SQLite3
 find_package(SQLite3 REQUIRED)

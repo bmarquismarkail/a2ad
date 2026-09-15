@@ -340,8 +340,16 @@ ControlPlane::Json ControlPlane::readOnly(const J& req) {
             return failure("invalid_request", "after must be a string and limit must be 1..500");
         const std::string after = req.value("after", "");
         const int limit = req.value("limit", 100);
-        Statement st(read_db_, "SELECT id,value FROM control_records WHERE kind=? AND id>? ORDER BY id LIMIT ?");
-        st.bind(1, kind); st.bind(2, after); sqlite3_bind_int(st.st, 3, limit + 1);
+        std::string query = "SELECT id,value FROM control_records WHERE kind=? AND id>?";
+        if (req.contains("session_id")) query += " AND COALESCE(json_extract(value, '$.session_id'), '') = ?";
+        if (req.contains("task_id")) query += " AND COALESCE(json_extract(value, '$.task_id'), '') = ?";
+        query += " ORDER BY id LIMIT ?";
+        Statement st(read_db_, query.c_str());
+        int bind_index = 1;
+        st.bind(bind_index++, kind); st.bind(bind_index++, after);
+        if (req.contains("session_id")) st.bind(bind_index++, req.at("session_id").get<std::string>());
+        if (req.contains("task_id")) st.bind(bind_index++, req.at("task_id").get<std::string>());
+        sqlite3_bind_int(st.st, bind_index, limit + 1);
         J items = J::array(); std::string next; bool more = false;
         while (st.row()) {
             auto id = st.text(0);
@@ -506,6 +514,9 @@ ControlPlane::Json ControlPlane::handle(const J& req, const Dispatch& dispatch) 
             if (enforce_ || request.contains("effects")) return failure("invalid_request", "request_id required for governed mutations");
             request["request_id"] = newId();
         }
+        if (request.value("op", "") == "artifact.materialize" && request.contains("sha256") &&
+            !request.at("sha256").is_string())
+            return failure("invalid_request", "sha256 must be a string");
         {
             std::lock_guard lock(mutex_); Transaction tx(db_);
             auto result = begin(request); tx.commit(); if (!result.is_null()) return result;
