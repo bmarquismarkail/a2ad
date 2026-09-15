@@ -6,10 +6,13 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <algorithm>
+#include <cctype>
 
 namespace kitty_a2a {
 
 namespace {
+struct WriteContext { std::string* out; bool* too_large; };
 // libcurl's global init is not thread-safe to call repeatedly. Use a
 // process-lifetime static.
 struct CurlGlobalInit {
@@ -22,9 +25,26 @@ CurlGlobalInit& curlGlobal() {
 }
 
 size_t writeCb(void* data, size_t size, size_t nmemb, void* userp) {
-    auto* out = static_cast<std::string*>(userp);
-    out->append(static_cast<char*>(data), size * nmemb);
+    auto* ctx = static_cast<WriteContext*>(userp);
+    if (size * nmemb > 64 * 1024 * 1024 - ctx->out->size()) { *ctx->too_large = true; return 0; }
+    ctx->out->append(static_cast<char*>(data), size * nmemb);
     return size * nmemb;
+}
+
+size_t headerCb(void* data, size_t size, size_t nmemb, void* userp) {
+    const size_t bytes = size * nmemb;
+    auto* headers = static_cast<std::map<std::string, std::string>*>(userp);
+    std::string line(static_cast<char*>(data), bytes);
+    if (line.rfind("HTTP/", 0) == 0) headers->clear();
+    auto colon = line.find(':');
+    if (colon != std::string::npos) {
+        auto key = line.substr(0, colon);
+        std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return std::tolower(c); });
+        auto first = line.find_first_not_of(" \t", colon + 1);
+        auto last = line.find_last_not_of(" \t\r\n");
+        (*headers)[key] = first == std::string::npos || last < first ? "" : line.substr(first, last - first + 1);
+    }
+    return bytes;
 }
 
 struct StreamContext { const std::function<bool(std::string_view)>* callback; };
@@ -66,6 +86,8 @@ HttpResponse CurlTransport::request(const std::string& endpoint, const std::stri
     }
 
     std::string resp_body;
+    bool response_too_large = false;
+    WriteContext write_context{&resp_body, &response_too_large};
     curl_slist* hdrs = nullptr;
     for (const auto& [k, v] : headers) {
         if (k == "X-A2AD-Client-Cert-File") curl_easy_setopt(curl, CURLOPT_SSLCERT, v.c_str());
@@ -75,12 +97,17 @@ HttpResponse CurlTransport::request(const std::string& endpoint, const std::stri
     // Ensure Accept is present for GETs (agent card discovery).
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp_body);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &write_context);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, headerCb);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &r.headers);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent_.c_str());
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, (long)(timeout_ms_ / 2));
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long)timeout_ms_);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    // Redirect targets must be explicitly configured; custom auth headers and
+    // client certificates must never follow a server-selected origin.
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
     // Disable SSL verification only if explicitly requested via env (a2ad
     // trusts the system CA store by default).
@@ -113,8 +140,8 @@ HttpResponse CurlTransport::request(const std::string& endpoint, const std::stri
     curl_easy_cleanup(curl);
 
     if (res != CURLE_OK) {
-        r.transport_error = true;
-        r.transport_error_detail = curl_easy_strerror(res);
+        if (response_too_large) { r.response_too_large = true; r.transport_error_detail = "HTTP response exceeds 64 MiB limit"; }
+        else { r.transport_error = true; r.transport_error_detail = curl_easy_strerror(res); }
         return r;
     }
     r.status = (int)http_code;

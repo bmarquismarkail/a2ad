@@ -166,3 +166,18 @@ ADD_TEST(persistence_across_reopen) {
     }
     fs::remove(dbpath);
 }
+
+ADD_TEST(message_only_interaction_remains_local_after_reopen) {
+    auto path = fs::temp_directory_path() / "a2ad_message_only_restart.db";
+    fs::remove(path);
+    Database db; std::string error;
+    CHECK(db.open(path.string(), &error));
+    Task task; task.id = "local-only"; task.agent = "agent";
+    task.state = TaskState::Completed; task.created_at = "T0"; task.updated_at = "T0";
+    db.insertTask(task); db.close();
+    CHECK(db.open(path.string(), &error));
+    auto loaded = db.getTask("local-only");
+    CHECK(loaded.has_value());
+    if (loaded) CHECK(!loaded->remote_task_id.has_value());
+    db.close(); fs::remove(path);
+}

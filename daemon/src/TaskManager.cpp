@@ -1,4 +1,8 @@
 #include "kitty_a2a/TaskManager.hpp"
+#include "kitty_a2a/ControlPlane.hpp"
+#include <fcntl.h>
+#include <unistd.h>
+#include <cerrno>
 
 #include <algorithm>
 #include <chrono>
@@ -121,19 +125,25 @@ TaskManager::TaskManager(Database& db, std::shared_ptr<A2AClient> a2a, const Con
     }
 }
 
-TaskManager::~TaskManager() = default;
+TaskManager::~TaskManager() {
+    for (auto& subscription : subscriptions_) subscription.request_stop();
+    subscriptions_.clear(); // join before destroying event sink, agent state, or database
+}
 
 void TaskManager::startSubscriptions() {
     for (const Task& persisted : db_.listNonTerminalTasks()) {
-        startSubscription(persisted);
+        std::string endpoint; AuthSpec auth;
+        if (resolveEndpoint(persisted.agent, &endpoint, &auth)) startSubscription(persisted);
     }
 }
 
 void TaskManager::startSubscription(const Task& task) {
+    std::lock_guard lock(state_mutex_);
     auto agent = agents_.find(task.agent.value());
     if (agent == agents_.end() || !agent->second.supports_streaming() || is_terminal(task.state) ||
         !task.remote_task_id || task.remote_task_id->empty()) return;
     const std::string task_id = task.id.value();
+    if (!subscribed_tasks_.insert(task_id).second) return;
     const std::string remote_task_id = task.remote_task_id->value();
     const AgentId agent_id = task.agent;
     subscriptions_.emplace_back([this, task_id, remote_task_id, agent_id](std::stop_token stop) {
@@ -176,7 +186,12 @@ void TaskManager::startSubscription(const Task& task) {
     });
 }
 
-bool TaskManager::resolveEndpoint(const AgentId& id, std::string* endpoint, AuthSpec* auth) const {
+bool TaskManager::resolveEndpoint(const AgentId& id, std::string* endpoint, AuthSpec* auth) {
+    std::lock_guard lock(state_mutex_);
+    if (!config_.agents.contains(id.value())) return false;
+    auto found = discovered_at_.find(id.value());
+    if (found == discovered_at_.end() || std::chrono::steady_clock::now() - found->second >= std::chrono::minutes(5))
+        discoverAgent(id.value());
     auto it = agents_.find(id.value());
     if (it == agents_.end()) return false;
     const Agent& a = it->second;
@@ -297,6 +312,7 @@ void TaskManager::reconcileOnStartup() {
             fresh.agent = t.agent;
             fresh.updated_at = now_iso();
             db_.updateTask(fresh);
+            emitStateChanged(fresh.id.value(), t.state, fresh.state);
             std::fprintf(stderr, "[a2ad] reconcile: task %s now %s\n",
                          t.id.value().c_str(), to_state_string(fresh.state).c_str());
         } else if (r.error_kind == A2AResult::ErrorKind::LocalNetwork) {
@@ -332,7 +348,7 @@ CreateTaskResponse TaskManager::createTask(const CreateTaskRequest& req) {
         payload += "\n[context]\nworking directory: " + req.context.cwd;
     }
 
-    A2AResult r = a2a_->sendMessage(endpoint, auth, payload, req.continue_task_id, req.continue_context_id);
+    A2AResult r = a2a_->sendMessage(endpoint, auth, payload, req.continue_task_id, req.continue_context_id, req.request_id);
 
     if (!r.ok) {
         resp.ok = false;
@@ -344,7 +360,8 @@ CreateTaskResponse TaskManager::createTask(const CreateTaskRequest& req) {
     Task t;
     if (r.task) {
         t = std::move(*r.task);
-        if (t.id.empty()) t.id = std::to_string(std::time(nullptr));
+        if (!t.remote_task_id && !t.id.empty()) t.remote_task_id = t.id;
+        t.id = local_interaction_id(); // remote IDs are only unique within their agent
         if (t.agent.value().empty()) t.agent = req.agent;
         if (t.context.value().empty()) t.context = req.continue_context_id.value();
         if (t.title.empty()) t.title = titleFromMessage(req.message);
@@ -371,6 +388,7 @@ CreateTaskResponse TaskManager::createTask(const CreateTaskRequest& req) {
     t.last_state_change = now_iso();
 
     db_.insertTask(t);
+    if (event_sink_) event_sink_({{"type", "task.created"}, {"task_id", t.id.value()}, {"state", to_state_string(t.state)}});
     startSubscription(t);
 
     resp.ok = true;
@@ -381,7 +399,7 @@ CreateTaskResponse TaskManager::createTask(const CreateTaskRequest& req) {
     return resp;
 }
 
-CreateTaskResponse TaskManager::respondToTask(const std::string& task_id, const std::string& response_text) {
+CreateTaskResponse TaskManager::respondToTask(const std::string& task_id, const std::string& response_text, const std::string& request_id) {
     CreateTaskResponse resp;
     auto existing = db_.getTask(task_id);
     if (!existing) {
@@ -400,7 +418,7 @@ CreateTaskResponse TaskManager::respondToTask(const std::string& task_id, const 
     }
     TaskId remote_id;
     if (existing->remote_task_id) remote_id = *existing->remote_task_id;
-    A2AResult r = a2a_->sendMessage(endpoint, auth, response_text, remote_id, existing->context);
+    A2AResult r = a2a_->sendMessage(endpoint, auth, response_text, remote_id, existing->context, request_id);
     if (!r.ok) {
         resp.ok = false;
         resp.error_kind = error_kind_name(r.error_kind);
@@ -581,7 +599,7 @@ A2AResult TaskManager::getExtendedAgentCard(const std::string& agent) {
 
 bool TaskManager::materializeArtifact(const std::string& task_id, const std::string& artifact_id,
                                       size_t part_index, const std::string& output_dir,
-                                      std::string* output_path, std::string* error) {
+                                      std::string* output_path, std::string* error, const std::string& expected_sha256) {
     auto task = db_.getTask(task_id);
     if (!task) { if (error) *error = "no such task: " + task_id; return false; }
     auto it = std::find_if(task->artifacts.begin(), task->artifacts.end(),
@@ -599,6 +617,16 @@ bool TaskManager::materializeArtifact(const std::string& task_id, const std::str
     else if (!part.url.empty()) {
         std::string endpoint; AuthSpec auth;
         if (!resolveEndpoint(task->agent, &endpoint, &auth)) { if (error) *error = "unknown task agent"; return false; }
+        auto origin = [](const std::string& url) {
+            auto scheme = url.find("://");
+            return scheme == std::string::npos ? std::string() : url.substr(0, url.find('/', scheme + 3));
+        };
+        if (part.url.rfind("https://", 0) != 0 && part.url.rfind("http://", 0) != 0) {
+            if (error) *error = "artifact URL must use HTTP(S)";
+            return false;
+        }
+        // Never forward agent credentials to an artifact's unrelated origin.
+        if (origin(part.url) != origin(endpoint)) auth = AuthSpec{};
         auto response = a2a_->download(part.url, auth);
         if (response.transport_error || response.status < 200 || response.status >= 300) {
             if (error) *error = response.transport_error ? response.transport_error_detail
@@ -608,16 +636,45 @@ bool TaskManager::materializeArtifact(const std::string& task_id, const std::str
         bytes = std::move(response.body);
     } else { if (error) *error = "artifact part has no materializable content"; return false; }
 
+    const auto sha256 = ControlPlane::digest(bytes);
+    std::string expected = expected_sha256;
+    if (expected.empty() && part.metadata.is_object() && part.metadata.contains("sha256") && part.metadata["sha256"].is_string())
+        expected = part.metadata["sha256"].get<std::string>();
+    if (!expected.empty() && expected != sha256) {
+        if (error) *error = "artifact SHA-256 mismatch";
+        return false;
+    }
     fs::path dir = output_dir.empty() ? fs::current_path() : fs::path(output_dir);
     std::error_code ec; fs::create_directories(dir, ec);
     if (ec) { if (error) *error = "cannot create output directory: " + ec.message(); return false; }
-    fs::path path = dir / safe_filename(part.filename, *it, part_index);
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out || !out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()))) {
-        if (error) *error = "cannot write artifact: " + path.string();
+    dir = fs::canonical(dir, ec);
+    if (ec) { if (error) *error = "cannot resolve output directory"; return false; }
+    const auto name = safe_filename(part.filename, *it, part_index);
+    if (name.empty() || name == "." || name == ".." || name.find('/') != std::string::npos || name.find('\0') != std::string::npos) {
+        if (error) *error = "invalid artifact filename";
         return false;
     }
-    if (output_path) *output_path = fs::absolute(path).lexically_normal().string();
+    const int directory = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (directory < 0) { if (error) *error = "cannot open output directory"; return false; }
+    const int fd = ::openat(directory, name.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) { ::close(directory); if (error) *error = "cannot create artifact (existing files are never overwritten)"; return false; }
+    size_t offset = 0;
+    while (offset < bytes.size()) {
+        auto n = ::write(fd, bytes.data() + offset, bytes.size() - offset);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        offset += static_cast<size_t>(n);
+    }
+    bool saved = offset == bytes.size() && ::fsync(fd) == 0;
+    if (::close(fd) != 0) saved = false;
+    if (!saved) ::unlinkat(directory, name.c_str(), 0);
+    ::close(directory);
+    if (!saved) { if (error) *error = "artifact write failed"; return false; }
+    const auto path = (dir / name).string();
+    if (output_path) *output_path = path;
+    if (event_sink_) event_sink_({{"type", "artifact.materialized"}, {"task_id", task_id},
+        {"artifact_id", artifact_id}, {"part", part_index}, {"sha256", sha256}, {"bytes", bytes.size()},
+        {"verified_expected_digest", !expected.empty()}, {"path", path}});
     return true;
 }
 
@@ -626,6 +683,7 @@ std::optional<Task> TaskManager::getTask(const std::string& id) {
 }
 
 std::vector<Agent> TaskManager::listAgents() {
+    std::lock_guard lock(state_mutex_);
     std::vector<Agent> out;
     for (auto& [id, a] : agents_) out.push_back(a);
     std::sort(out.begin(), out.end(), [](const Agent& x, const Agent& y) { return x.id.value() < y.id.value(); });
@@ -633,6 +691,7 @@ std::vector<Agent> TaskManager::listAgents() {
 }
 
 std::vector<std::string> TaskManager::listAgentIds() const {
+    std::lock_guard lock(state_mutex_);
     std::vector<std::string> ids;
     for (const auto& [id, a] : agents_) ids.push_back(id);
     std::sort(ids.begin(), ids.end());
@@ -640,6 +699,7 @@ std::vector<std::string> TaskManager::listAgentIds() const {
 }
 
 Agent TaskManager::discoverAgent(const std::string& id) {
+    std::lock_guard lock(state_mutex_);
     auto it = agents_.find(id);
     if (it == agents_.end()) {
         Agent empty; empty.id = id;
@@ -647,6 +707,7 @@ Agent TaskManager::discoverAgent(const std::string& id) {
     }
     Agent& a = it->second;
     AgentCard card = a2a_->discover(a.endpoint);
+    discovered_at_[id] = std::chrono::steady_clock::now();
     a.card = card;
     a.available = card.valid;
     if (card.valid) {

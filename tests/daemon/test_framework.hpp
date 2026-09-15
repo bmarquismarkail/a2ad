@@ -7,6 +7,7 @@
 // The global result counter is a function-local static in g_result() so it is
 // shared across all TUs without a separate definition.
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <sstream>
@@ -47,8 +48,12 @@ inline void register_one(const char* name, std::function<void()> fn) {
 // Runs all registered tests, printing a per-test line and the final tally.
 // Returns 0 on success, 1 on any failure.
 inline int run_all() {
-    int exit_code = 0;
+    const char* exclude = std::getenv("A2AD_TEST_EXCLUDE");
     for (auto& t : registry()) {
+        if (exclude && *exclude != '\0' && t.name.find(exclude) != std::string::npos) {
+            std::fprintf(stderr, "  SKIP %s (A2AD_TEST_EXCLUDE)\n", t.name.c_str());
+            continue;
+        }
         std::fprintf(stderr, "  %s\n", t.name.c_str());
         t.fn();
     }

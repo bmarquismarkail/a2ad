@@ -6,6 +6,7 @@
 #include "kitty_a2a/TaskManager.hpp"
 
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <unistd.h>
@@ -186,8 +187,74 @@ ADD_TEST(reconciliation_preserves_agent_routing) {
 
     auto refreshed = manager.refreshTask("persisted-task");
     CHECK(refreshed.ok);
-    CHECK_EQ(transport->calls, 2);
+    // Three lazy discovery probes, then two task reads. Discovery is cached.
+    CHECK_EQ(transport->calls, 5);
 
     db.close();
     fs::remove(dbpath);
+}
+
+ADD_TEST(artifact_digest_and_symlink_protection) {
+    auto dir = fs::temp_directory_path() / ("a2ad_artifact_guard_" + std::to_string(getpid()));
+    fs::remove_all(dir); fs::create_directories(dir);
+    Database db; std::string error, output;
+    CHECK(db.open((dir / "state.db").string(), &error));
+    Config config;
+    auto transport = std::make_shared<ReconcileTransport>();
+    auto client = std::make_shared<A2AClient>(transport, std::shared_ptr<CredentialProvider>(make_credential_provider()));
+    TaskManager manager(db, client, config);
+    Task task; task.id = "artifact-task"; task.agent = "unused"; task.created_at = "T0"; task.updated_at = "T0";
+    Artifact artifact; artifact.artifact_id = "artifact";
+    Part part; part.text = "abc"; part.filename = "result.txt"; artifact.parts.push_back(part);
+    task.artifacts.push_back(artifact); db.insertTask(task);
+    CHECK(!manager.materializeArtifact("artifact-task", "artifact", 0, dir.string(), &output, &error, "wrong-digest"));
+    CHECK(!fs::exists(dir / "result.txt"));
+    std::ofstream(dir / "target.txt") << "untouched";
+    fs::create_symlink(dir / "target.txt", dir / "result.txt");
+    CHECK(!manager.materializeArtifact("artifact-task", "artifact", 0, dir.string(), &output, &error));
+    fs::remove(dir / "result.txt");
+    CHECK(manager.materializeArtifact("artifact-task", "artifact", 0, dir.string(), &output, &error,
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+    std::ifstream in(dir / "target.txt"); std::string original; in >> original; CHECK_EQ(original, "untouched");
+    CHECK(!manager.materializeArtifact("artifact-task", "artifact", 0, dir.string(), &output, &error));
+    db.close(); fs::remove_all(dir);
+}
+ADD_TEST(remote_task_ids_are_namespaced_by_local_identity) {
+    auto path = fs::temp_directory_path() / ("a2ad_task_identity_" + std::to_string(getpid()) + ".db");
+    fs::remove(path); Database db; std::string error; CHECK(db.open(path.string(), &error));
+    Config config; AgentConfig a; a.endpoint = "https://agent.example/a2a";
+    config.agents["first"] = a; config.agents["second"] = a;
+    auto transport = std::make_shared<ReconcileTransport>();
+    auto client = std::make_shared<A2AClient>(transport, std::shared_ptr<CredentialProvider>(make_credential_provider()));
+    TaskManager manager(db, client, config);
+    CreateTaskRequest request; request.agent = "first"; request.message = "test";
+    auto first = manager.createTask(request); request.agent = "second";
+    auto second = manager.createTask(request);
+    CHECK(first.ok && second.ok); CHECK(first.task_id != second.task_id);
+    CHECK_EQ(db.listTasks().size(), size_t{2});
+    auto stored = db.getTask(first.task_id.value());
+    CHECK(stored && stored->remote_task_id && stored->remote_task_id->value() == "persisted-task");
+    db.close(); fs::remove(path);
+}
+
+ADD_TEST(discovery_revalidates_etag_without_losing_card) {
+    class Conditional : public HttpTransport {
+    public:
+        bool conditional = false;
+        int calls = 0;
+        HttpResponse request(const std::string&, const std::string&, const std::string&, const std::string&,
+                             const std::vector<std::pair<std::string, std::string>>& headers) override {
+            ++calls;
+            if (calls == 1) return {200,
+                R"({"name":"cached","supportedInterfaces":[{"url":"https://agent.example","protocolBinding":"JSONRPC","protocolVersion":"1.0"}]})",
+                false, "", {{"etag", "\"v1\""}}};
+            for (const auto& header : headers) if (header.first == "If-None-Match" && header.second == "\"v1\"") conditional = true;
+            return {304, "", false, ""};
+        }
+    };
+    auto transport = std::make_shared<Conditional>();
+    A2AClient client(transport, std::shared_ptr<CredentialProvider>(make_credential_provider()));
+    CHECK(client.discover("https://agent.example").valid);
+    auto card = client.discover("https://agent.example");
+    CHECK(card.valid); CHECK_EQ(card.name, "cached"); CHECK(transport->conditional);
 }

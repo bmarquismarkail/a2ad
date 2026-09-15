@@ -13,6 +13,8 @@
 #include <fstream>
 #include <string>
 #include <sys/types.h>
+#include <sys/file.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <thread>
 #include <chrono>
@@ -24,6 +26,7 @@
 
 #include "kitty_a2a/A2AClient.hpp"
 #include "kitty_a2a/Config.hpp"
+#include "kitty_a2a/ControlPlane.hpp"
 #include "kitty_a2a/Credentials.hpp"
 #include "kitty_a2a/Database.hpp"
 #include "kitty_a2a/HttpTransport.hpp"
@@ -164,7 +167,7 @@ int main(int argc, char** argv) {
     // Load config.
     std::string cfg_err;
     Config config = load_config(config_path, /*require=*/false, &cfg_err);
-    if (!cfg_err.empty()) std::fprintf(stderr, "[a2ad] config: %s\n", cfg_err.c_str());
+    if (!cfg_err.empty()) { std::fprintf(stderr, "[a2ad] config: %s\n", cfg_err.c_str()); return 1; }
     if (config.agents.empty()) {
         std::fprintf(stderr, "[a2ad] no agents configured (config: %s); daemon idle\n", config_path.c_str());
     }
@@ -188,11 +191,23 @@ int main(int argc, char** argv) {
         if (devnull >= 0) { dup2(devnull, 0); dup2(devnull, 1); dup2(devnull, 2); }
     }
 
-    // Open database.
-    Database db;
-    std::string db_err;
+    // Hold an instance lock before any recovery writes. A second daemon must
+    // not mark the live daemon's in-flight executions uncertain.
     std::error_code ec;
     fs::create_directories(fs::path(paths.db).parent_path(), ec);
+    struct InstanceLock {
+        int fd = -1;
+        ~InstanceLock() { if (fd >= 0) ::close(fd); }
+    } instance;
+    instance.fd = ::open((paths.db + ".lock").c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+    struct stat lock_stat{};
+    if (instance.fd < 0 || ::fstat(instance.fd, &lock_stat) != 0 || !S_ISREG(lock_stat.st_mode) ||
+        lock_stat.st_uid != ::geteuid() || ::flock(instance.fd, LOCK_EX | LOCK_NB) != 0) {
+        std::fprintf(stderr, "[a2ad] cannot acquire database instance lock\n");
+        return 1;
+    }
+    Database db;
+    std::string db_err;
     if (!db.open(paths.db, &db_err)) {
         std::fprintf(stderr, "[a2ad] fatal: %s\n", db_err.c_str());
         return 1;
@@ -204,6 +219,13 @@ int main(int argc, char** argv) {
     auto transport = make_curl_transport(30000);
     auto a2a = std::make_shared<A2AClient>(transport, creds_shared);
 
+    std::unique_ptr<ControlPlane> control_ptr;
+    try { control_ptr = std::make_unique<ControlPlane>(paths.db, config.enforce_policy); }
+    catch (const std::exception& e) {
+        std::fprintf(stderr, "[a2ad] fatal: control-plane initialization failed: %s\n", e.what());
+        return 1;
+    }
+    ControlPlane& control = *control_ptr;
     TaskManager tm(db, a2a, config);
 
     // Build the IPC server. The handler is a reference into a shared struct so
@@ -215,7 +237,7 @@ int main(int argc, char** argv) {
     };
     IpcCtx ctx{&tm, nullptr};
 
-    auto ipc_ptr = std::make_unique<IpcServer>(paths.socket, [&](const nlohmann::json& req) -> nlohmann::json {
+    auto dispatch = [&](const nlohmann::json& req) -> nlohmann::json {
         TaskManager& tm = *ctx.tm;
         std::string op = req.value("op", "");
         if (op == "submit") {
@@ -230,6 +252,7 @@ int main(int argc, char** argv) {
             }
             r.agent = requested_agent;
             r.message = req.value("message", "");
+            r.request_id = req.value("request_id", "");
             r.context.cwd = cwd;
             r.continue_task_id = req.value("task_id", "");
             r.continue_context_id = req.value("context_id", "");
@@ -318,7 +341,7 @@ int main(int argc, char** argv) {
         if (op == "respond") {
             std::string id = req.value("task_id", "");
             std::string text = req.value("message", "");
-            auto resp = tm.respondToTask(id, text);
+            auto resp = tm.respondToTask(id, text, req.value("request_id", ""));
             if (!resp.ok) return {{"ok", false}, {"error", resp.message}, {"error_kind", resp.error_kind}};
             return {{"ok", true}, {"task_id", resp.task_id.value()}, {"state", to_state_string(resp.state)}};
         }
@@ -342,15 +365,36 @@ int main(int argc, char** argv) {
             std::string path, error;
             if (!tm.materializeArtifact(req.value("task_id", ""), req.value("artifact_id", ""),
                                         req.value("part", size_t{0}), req.value("output_dir", ""),
-                                        &path, &error)) return {{"ok", false}, {"error", error}};
+                                        &path, &error, req.value("sha256", ""))) return {{"ok", false}, {"error", error}};
             return {{"ok", true}, {"path", path}};
         }
         if (op == "ping") {
             return {{"ok", true}, {"pong", true}};
         }
         return {{"ok", false}, {"error", "unknown op: " + op}};
+    };
+    auto ipc_ptr = std::make_unique<IpcServer>(paths.socket, [&](nlohmann::json req) -> nlohmann::json {
+        // Resolve routing before hashing the request so approval is bound to
+        // the actual target; a configuration change invalidates prior approval.
+        auto op = req.value("op", "");
+        if (op == "submit" && req.value("agent", "").empty()) {
+            auto routed = config.default_agent_for(req.value("cwd", ""));
+            if (routed) req["agent"] = *routed;
+        }
+        if ((op == "respond" || op == "cancel" || op == "artifact.materialize") && req.contains("task_id")) {
+            if (auto task = tm.getTask(req.value("task_id", ""))) req["agent"] = task->agent.value();
+        }
+        if (op == "route.explain") {
+            auto selected = config.default_agent_for(req.value("cwd", ""));
+            return {{"ok", true}, {"agent", selected.value_or("")},
+                {"reason", selected ? "longest matching configured project path" : "no matching project rule"},
+                {"health", selected ? control.health(*selected) : nlohmann::json()},
+                {"fallback", "none; unavailable or quarantined targets are never silently replaced"}};
+        }
+        return control.handle(req, dispatch);
     });
 
+    tm.setEventSink([&control](const nlohmann::json& ev) { control.event(ev); });
     std::string ipc_err;
     if (!ipc_ptr->start(&ipc_err)) {
         std::fprintf(stderr, "[a2ad] fatal: IPC: %s\n", ipc_err.c_str());
@@ -358,13 +402,11 @@ int main(int argc, char** argv) {
     }
     ctx.ipc = ipc_ptr.get();
     g_ipc = ipc_ptr.get();
-    tm.setEventSink([ctx](const nlohmann::json& ev) {
-        if (ctx.ipc) ctx.ipc->broadcastEvent(ev);
-    });
 
     // Agent discovery at startup (best-effort; failures mark the agent
     // unavailable and are surfaced in `agents`).
-    tm.discoverAllAgents();
+    // Discover lazily on the first operation for each agent. Reconciliation
+    // below only discovers agents that own outstanding tasks.
 
     // Reconcile non-terminal tasks against their endpoints.
     if (!no_reconcile) tm.reconcileOnStartup();
@@ -390,6 +432,6 @@ int main(int argc, char** argv) {
 
     std::fprintf(stderr, "[a2ad] shutting down\n");
     ipc_ptr->stop();
-    db.close();
+    // TaskManager joins subscriptions before Database is destroyed.
     return 0;
 }

@@ -155,6 +155,9 @@ Config load_config(const std::string& path, bool require, std::string* error) {
             }
         }
 
+        if (root["policy"] && root["policy"]["enforce"])
+            cfg.enforce_policy = root["policy"]["enforce"].as<bool>();
+
         if (root["ipc"]) {
             const auto& ipc = root["ipc"];
             if (ipc["socket"]) {

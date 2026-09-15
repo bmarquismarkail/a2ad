@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <mutex>
 #include <set>
+#include <chrono>
 
 namespace fs = std::filesystem;
 
@@ -29,22 +30,25 @@ int make_nonblock(int fd) {
 
 // Send a full buffer, retrying on EINTR/EAGAIN. Returns true on full send.
 bool send_all(int fd, const char* buf, size_t n) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     size_t off = 0;
-    while (off < n) {
+    while (off < n && std::chrono::steady_clock::now() < deadline) {
         ssize_t r = ::send(fd, buf + off, n - off, MSG_NOSIGNAL);
         if (r < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN) { usleep(1000); continue; }
             return false;
         }
+        if (r == 0) return false;
         off += (size_t)r;
     }
-    return true;
+    return off == n;
 }
 }  // namespace
 
 struct IpcServer::Impl {
     int listen_fd = -1;
+    bool bound = false;
     std::set<int> clients;       // connected client fds
     std::set<int> serving;       // fds currently inside handler_ (excluded from broadcast)
     std::mutex clients_mutex;
@@ -56,22 +60,32 @@ IpcServer::IpcServer(std::string socket_path, Handler handler)
 IpcServer::~IpcServer() { stop(); }
 
 bool IpcServer::start(std::string* error) {
-    // Remove any stale socket from a previous run.
-    if (fs::exists(socket_path_)) {
-        std::error_code remove_error;
-        fs::remove(socket_path_, remove_error);
-        if (remove_error) {
-            if (error) *error = "cannot remove stale socket " + socket_path_ + ": " + remove_error.message();
+    // Refuse to remove arbitrary paths or a socket owned by another user.
+    struct stat existing{};
+    if (::lstat(socket_path_.c_str(), &existing) == 0) {
+        if (!S_ISSOCK(existing.st_mode) || existing.st_uid != ::geteuid()) {
+            if (error) *error = "socket path exists and is not an owned socket";
             return false;
         }
+        int probe = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        sockaddr_un address{}; address.sun_family = AF_UNIX;
+        if (socket_path_.size() >= sizeof(address.sun_path)) { if (probe >= 0) ::close(probe); return false; }
+        std::strncpy(address.sun_path, socket_path_.c_str(), sizeof(address.sun_path) - 1);
+        if (probe < 0) return false;
+        int connected = ::connect(probe, reinterpret_cast<sockaddr*>(&address), sizeof(address));
+        int connect_error = errno; ::close(probe);
+        if (connected == 0 || connect_error != ECONNREFUSED) {
+            if (error) *error = "socket is active or cannot be safely replaced";
+            return false;
+        }
+        if (::unlink(socket_path_.c_str()) != 0) return false;
     }
-    // Ensure the parent directory exists (0700 so the socket isn't exposed).
     auto parent = fs::path(socket_path_).parent_path();
     std::error_code ec;
-    fs::create_directories(parent, ec);
-    if (parent.empty() || fs::exists(parent)) {
-        ::chmod(parent.c_str(), 0700);
-    }
+    bool created = fs::create_directories(parent, ec);
+    if (ec) { if (error) *error = "cannot create socket directory: " + ec.message(); return false; }
+    // Never chmod a caller's pre-existing directory (e.g. /tmp).
+    if (created && ::chmod(parent.c_str(), 0700) != 0) return false;
 
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) { if (error) *error = "socket() failed: " + std::string(std::strerror(errno)); return false; }
@@ -91,7 +105,8 @@ bool IpcServer::start(std::string* error) {
         if (error) *error = "bind() failed on " + socket_path_ + ": " + std::string(std::strerror(errno));
         return false;
     }
-    if (::chmod(socket_path_.c_str(), 0600) < 0) { /* warn-level */ }
+    impl_->bound = true;
+    if (::chmod(socket_path_.c_str(), 0600) < 0) { ::close(fd); if (error) *error = "cannot secure socket permissions"; return false; }
 
     if (::listen(fd, 16) < 0) {
         ::close(fd);
@@ -132,6 +147,12 @@ void IpcServer::acceptLoop() {
 }
 
 void IpcServer::handleConnection(int cfd) {
+#ifdef SO_PEERCRED
+    struct ucred peer{}; socklen_t peer_size = sizeof(peer);
+    if (::getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, &peer, &peer_size) != 0 || peer.uid != ::geteuid()) {
+        ::close(cfd); return;
+    }
+#endif
     make_nonblock(cfd);
     {
         std::lock_guard lk(impl_->clients_mutex);
@@ -144,7 +165,8 @@ void IpcServer::handleConnection(int cfd) {
     char buf[4096];
     size_t total = 0;
     bool got_request = false;
-    while (total < kMaxMessage) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (running_.load() && total < kMaxMessage && std::chrono::steady_clock::now() < deadline) {
         ssize_t r = ::recv(cfd, buf, sizeof(buf), 0);
         if (r < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) { usleep(2000); continue; }
@@ -213,16 +235,21 @@ void IpcServer::stop() {
         // close() unblocks accept()
         ::shutdown(impl_->listen_fd, SHUT_RDWR);
         ::close(impl_->listen_fd);
-        impl_->listen_fd = -1;
+
+    }
+    {
+        std::lock_guard lk(impl_->clients_mutex);
+        for (int cfd : impl_->clients) ::shutdown(cfd, SHUT_RDWR);
     }
     if (accept_thread_.joinable()) accept_thread_.join();
+    impl_->listen_fd = -1;
 
     std::lock_guard lk(impl_->clients_mutex);
     for (int cfd : impl_->clients) ::close(cfd);
     impl_->clients.clear();
 
     std::error_code ec;
-    fs::remove(socket_path_, ec);
+    if (impl_->bound) { fs::remove(socket_path_, ec); impl_->bound = false; }
 }
 
 }  // namespace kitty_a2a

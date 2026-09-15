@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 #include <thread>
+#include <chrono>
+#include <set>
 
 #include "kitty_a2a/A2AClient.hpp"
 #include "kitty_a2a/AgentCard.hpp"
@@ -29,6 +31,7 @@ struct RequestContext {
 struct CreateTaskRequest {
     AgentId agent;
     std::string message;
+    std::string request_id;
     RequestContext context;
     // Optional explicit continuation: an existing task_id / context_id.
     TaskId continue_task_id;
@@ -84,7 +87,8 @@ public:
 
     // Respond to an INPUT_REQUIRED / AUTH_REQUIRED task by sending a new A2A
     // message in the same task/context.
-    CreateTaskResponse respondToTask(const std::string& task_id, const std::string& response_text);
+    CreateTaskResponse respondToTask(const std::string& task_id, const std::string& response_text,
+                                     const std::string& request_id = {});
 
     // Cancel a task (remote CancelTask + local state update).
     A2AResult cancelTask(const std::string& task_id);
@@ -118,7 +122,8 @@ public:
     // The returned path is canonicalized beneath output_dir.
     bool materializeArtifact(const std::string& task_id, const std::string& artifact_id,
                              size_t part_index, const std::string& output_dir,
-                             std::string* output_path, std::string* error);
+                             std::string* output_path, std::string* error,
+                             const std::string& expected_sha256 = {});
 
     // Refresh an agent's Agent Card + availability. Returns the agent after.
     Agent discoverAgent(const std::string& id);
@@ -133,13 +138,15 @@ private:
     void startSubscription(const Task& task);
     void emitStateChanged(const std::string& task_id, TaskState old_state, TaskState new_state);
     // Resolve the agent's endpoint + auth spec for a request.
-    bool resolveEndpoint(const AgentId& id, std::string* endpoint, AuthSpec* auth) const;
+    bool resolveEndpoint(const AgentId& id, std::string* endpoint, AuthSpec* auth);
 
     Database& db_;
     std::shared_ptr<A2AClient> a2a_;
     Config config_;
 
-    std::mutex state_mutex_;
+    mutable std::recursive_mutex state_mutex_;
+    std::map<std::string, std::chrono::steady_clock::time_point> discovered_at_;
+    std::set<std::string> subscribed_tasks_;
     std::map<std::string, Agent> agents_;   // by agent id
 
     // Cached auth specs per agent (re-resolved on demand; values never logged).

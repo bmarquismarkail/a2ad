@@ -128,7 +128,7 @@ int main() {
         "            self._send(200, {\n"
         "                'name':'mock-agent','description':'e2e mock','version':'1.0.0',\n"
         "                'capabilities':{'streaming':False},\n"
-        "                'supportedInterfaces':[{'url':'http://127.0.0.1:%d/a2a','protocolBinding':'jsonrpc','protocolVersion':'1.0.0'}],\n"
+        "                'supportedInterfaces':[{'url':'http://127.0.0.1:' + str(PORT) + '/a2a','protocolBinding':'jsonrpc','protocolVersion':'1.0.0'}],\n"
         "                'securitySchemes':{}})\n"
         "        else:\n"
         "            self._send(404, {'error':'not found'})\n"

@@ -26,10 +26,11 @@ else()
 endif()
 
 # libcurl
-find_package(CURL REQUIRED)
+find_package(CURL 7.85.0 REQUIRED)
 
 # SQLite3
 find_package(SQLite3 REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 # yaml-cpp
 find_package(yaml-cpp REQUIRED)
@@ -40,7 +41,10 @@ find_package(Threads REQUIRED)
 # Native A2A gRPC binding. The checked-in proto is the normative v1 schema
 # with documentation-only google.api annotations removed; wire field numbers,
 # messages, and service definitions are unchanged.
-find_package(Protobuf CONFIG REQUIRED)
+find_package(Protobuf CONFIG QUIET)
+if(NOT Protobuf_FOUND)
+    find_package(Protobuf REQUIRED)
+endif()
 find_package(gRPC CONFIG REQUIRED)
 set(A2A_PROTO ${CMAKE_CURRENT_SOURCE_DIR}/proto/a2a.proto)
 set(A2A_PROTO_SRC ${CMAKE_CURRENT_BINARY_DIR}/a2a.pb.cc)
@@ -60,6 +64,7 @@ add_custom_command(
 
 # --- Daemon library (everything except main) ---------------------------------
 add_library(a2ad_core STATIC
+    daemon/src/ControlPlane.cpp
     daemon/src/types.cpp
     daemon/src/Artifact.cpp
     daemon/src/AgentCard.cpp
@@ -78,7 +83,8 @@ target_include_directories(a2ad_core PUBLIC daemon/include PRIVATE ${CMAKE_CURRE
 target_link_libraries(a2ad_core PUBLIC
     nlohmann_json::nlohmann_json
     CURL::libcurl
-    SQLite3::SQLite3
+    SQLite::SQLite3
+    OpenSSL::Crypto
     yaml-cpp::yaml-cpp
     Threads::Threads
     protobuf::libprotobuf
@@ -93,6 +99,7 @@ target_link_libraries(a2ad PRIVATE a2ad_core)
 enable_testing()
 
 add_executable(a2ad_tests
+    tests/daemon/control_plane_test.cpp
     tests/daemon/test_main.cpp
     tests/daemon/types_test.cpp
     tests/daemon/artifact_test.cpp
@@ -128,3 +135,24 @@ set_tests_properties(daemon_mode PROPERTIES TIMEOUT 30)
 install(TARGETS a2ad RUNTIME DESTINATION bin)
 install(FILES kitten/a2a.py DESTINATION ${CMAKE_INSTALL_PREFIX}/share/kitty/kittens)
 install(FILES config/agents.example.yaml DESTINATION ${CMAKE_INSTALL_PREFIX}/share/kitty-a2a)
+
+# Optional direct-dependency inventory with source revision and binary SHA-256.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_custom_target(sbom
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/generate_sbom.py
+            --binary $<TARGET_FILE:a2ad> --output ${CMAKE_BINARY_DIR}/a2ad.cdx.json
+            --dependency "curl=${CURL_VERSION_STRING}"
+            --dependency "sqlite=${SQLite3_VERSION}"
+            --dependency "openssl=${OPENSSL_VERSION}"
+            --dependency "protobuf=${Protobuf_VERSION}"
+            --dependency "grpc=${gRPC_VERSION}"
+            --dependency "yaml-cpp=${yaml-cpp_VERSION}"
+            --dependency "nlohmann-json=${nlohmann_json_VERSION}"
+        DEPENDS a2ad VERBATIM)
+endif()
+if(Python3_Interpreter_FOUND)
+    add_test(NAME control_plane_ipc
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/ipc/control_plane.py $<TARGET_FILE:a2ad>)
+    set_tests_properties(control_plane_ipc PROPERTIES TIMEOUT 45)
+endif()
